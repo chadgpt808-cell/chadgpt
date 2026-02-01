@@ -1,4 +1,4 @@
-# 🦞 OpenClaw Lite
+# OpenClaw Lite
 
 **The same lobster, smaller shell.**
 
@@ -11,7 +11,8 @@ OpenClaw Lite is a stripped-down version of [OpenClaw](https://github.com/opencl
 - Connects to WhatsApp via Baileys
 - Uses Claude (Anthropic) for intelligence
 - Maintains conversation history
-- Has the same OpenClaw personality
+- Supports custom personality via SOUL.md
+- Includes a kiosk mode for dedicated devices
 
 ## Requirements
 
@@ -24,7 +25,7 @@ OpenClaw Lite is a stripped-down version of [OpenClaw](https://github.com/opencl
 
 ```bash
 # Clone and install
-git clone https://github.com/YOUR_USERNAME/openclaw-lite
+git clone https://github.com/Hollando78/openclaw-lite
 cd openclaw-lite
 npm install
 
@@ -45,7 +46,7 @@ npm run dev
 pkg update && pkg install nodejs-lts
 
 # Clone and run
-git clone https://github.com/YOUR_USERNAME/openclaw-lite
+git clone https://github.com/Hollando78/openclaw-lite
 cd openclaw-lite
 npm install
 npm run dev
@@ -62,6 +63,49 @@ Set these in your `.env` file or as environment variables:
 | `OPENCLAW_MAX_TOKENS` | No | `4096` | Max tokens per response |
 | `OPENCLAW_MAX_HISTORY` | No | `50` | Messages to keep in history |
 | `OPENCLAW_ALLOW_LIST` | No | *(all)* | Comma-separated phone numbers |
+| `OPENCLAW_OWNER` | No | - | Owner phone number for admin |
+| `OPENCLAW_WORKSPACE_DIR` | No | `~/.openclaw-lite` | Directory for SOUL.md and config |
+| `OPENCLAW_STATUS_PORT` | No | `8080` | Kiosk status server port |
+
+## Custom Personality (SOUL.md)
+
+Customize your bot's personality by creating a `SOUL.md` file:
+
+```bash
+# Copy the example
+cp SOUL.example.md ~/.openclaw-lite/SOUL.md
+
+# Edit to your liking
+nano ~/.openclaw-lite/SOUL.md
+```
+
+The bot reloads SOUL.md every 60 seconds, so you can edit it without restarting.
+
+Example SOUL.md:
+```markdown
+## Personality
+- Friendly and helpful
+- Speaks like a pirate
+- Loves puns
+
+## Tone
+Keep it light and fun!
+```
+
+No SOUL.md? The bot uses a default lobster-themed personality.
+
+## Kiosk Mode
+
+OpenClaw Lite includes a built-in status server for running on dedicated devices.
+
+1. Start the bot normally
+2. Open `http://localhost:8080` in a browser
+3. See live status: connection state, QR code, message counts, uptime
+
+For a dedicated kiosk setup on Android:
+1. Install [Fully Kiosk Browser](https://www.fully-kiosk.com/) (free version works)
+2. Set it to load `http://localhost:8080`
+3. Enable kiosk mode to lock the display
 
 ## Commands
 
@@ -77,31 +121,28 @@ Designed for 1GB RAM devices:
 - Node.js baseline: ~50MB
 - Baileys (WhatsApp): ~50-100MB
 - Application: ~20MB
-- **Total: ~150-200MB** ✅
+- **Total: ~150-200MB**
 
 ## Compared to Full OpenClaw
 
 | Feature | OpenClaw | OpenClaw Lite |
 |---------|----------|---------------|
-| WhatsApp | ✅ | ✅ |
-| Telegram | ✅ | ❌ |
-| Discord | ✅ | ❌ |
-| Other channels | ✅ | ❌ |
-| Browser tools | ✅ | ❌ |
-| Canvas | ✅ | ❌ |
-| TTS | ✅ | ❌ |
-| Skills/plugins | ✅ | ❌ |
-| Gateway server | ✅ | ❌ |
-| Conversation memory | ✅ | ✅ |
-| Claude intelligence | ✅ | ✅ |
-| Lobster personality | ✅ | ✅ |
+| WhatsApp | Yes | Yes |
+| Telegram | Yes | No |
+| Discord | Yes | No |
+| Other channels | Yes | No |
+| Browser tools | Yes | No |
+| Canvas | Yes | No |
+| TTS | Yes | No |
+| Skills/plugins | Yes | No |
+| Gateway server | Yes | No |
+| Conversation memory | Yes | Yes |
+| Claude intelligence | Yes | Yes |
+| Custom personality | Yes | Yes |
+| Kiosk mode | No | Yes |
 | RAM usage | 500-800MB | 150-200MB |
 | Install size | 1.5GB+ | ~100MB |
 
 ## License
 
 MIT - Same as OpenClaw
-
----
-
-*EXFOLIATE! EXFOLIATE!* 🦞
