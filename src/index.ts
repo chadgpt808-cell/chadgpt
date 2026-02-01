@@ -113,7 +113,8 @@ function startStatusServer() {
     res.end(generateKioskHTML());
   });
 
-  server.listen(CONFIG.statusPort, () => {
+  // Bind to localhost only - never expose to network
+  server.listen(CONFIG.statusPort, "127.0.0.1", () => {
     console.log(`🖥️  Kiosk status page: http://localhost:${CONFIG.statusPort}`);
   });
 }
@@ -574,12 +575,14 @@ function isAllowed(senderId: string): boolean {
     return true; // No allowlist = allow all
   }
 
-  // Normalize the sender ID (remove @s.whatsapp.net suffix)
-  const normalized = senderId.replace(/@.*$/, "");
+  // Extract just the digits from sender ID (remove @s.whatsapp.net suffix and any non-digits)
+  const senderDigits = senderId.replace(/@.*$/, "").replace(/[^0-9]/g, "");
 
   return CONFIG.allowList.some((allowed) => {
-    const normalizedAllowed = allowed.replace(/[^0-9]/g, "");
-    return normalized.includes(normalizedAllowed) || normalizedAllowed.includes(normalized);
+    // Extract just digits from allowlist entry
+    const allowedDigits = allowed.replace(/[^0-9]/g, "");
+    // Exact match only - no partial matching
+    return senderDigits === allowedDigits;
   });
 }
 
