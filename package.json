@@ -1,0 +1,30 @@
+{
+  "name": "openclaw-lite",
+  "version": "1.0.0",
+  "description": "Minimal OpenClaw - WhatsApp AI assistant for low-resource devices",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "openclaw-lite": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@whiskeysockets/baileys": "7.0.0-rc.9",
+    "dotenv": "^17.2.3",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
