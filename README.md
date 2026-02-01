@@ -18,38 +18,88 @@ OpenClaw Lite is a stripped-down version of [OpenClaw](https://github.com/opencl
 
 - Node.js 20+ (works with Termux on Android)
 - Anthropic API key
-- ~200MB RAM at runtime
+- ~150MB RAM at runtime
 - ~100MB disk space
 
 ## Quick Start
 
 ```bash
-# Clone and install
+# Clone
 git clone https://github.com/Hollando78/openclaw-lite
 cd openclaw-lite
+
+# Install dependencies
 npm install
 
 # Configure
 cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
+nano .env  # Add your ANTHROPIC_API_KEY
 
 # Run
 npm run dev
 
-# Scan the QR code with WhatsApp
+# Scan the QR code with WhatsApp > Linked Devices > Link a Device
 ```
 
-## Running on Termux (Android)
+## Termux (Android) - Full Setup
 
 ```bash
-# Install Node.js in Termux
-pkg update && pkg install nodejs-lts
+# 1. Install Termux from F-Droid (not Play Store)
+#    https://f-droid.org/en/packages/com.termux/
 
-# Clone and run
+# 2. Update and install Node.js
+pkg update && pkg upgrade -y
+pkg install nodejs-lts git -y
+
+# 3. Clone and install
 git clone https://github.com/Hollando78/openclaw-lite
 cd openclaw-lite
 npm install
+
+# 4. Configure
+cp .env.example .env
+nano .env
+# Add: ANTHROPIC_API_KEY=sk-ant-your-key-here
+# Save: Ctrl+O, Enter, Ctrl+X
+
+# 5. Run
 npm run dev
+```
+
+## Run Persistently (Termux)
+
+### Option 1: Termux:Boot (Auto-start on reboot)
+
+```bash
+# Install Termux:Boot from F-Droid
+# https://f-droid.org/en/packages/com.termux.boot/
+
+# Create boot script
+mkdir -p ~/.termux/boot
+cat > ~/.termux/boot/openclaw.sh << 'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+cd ~/openclaw-lite
+npm start >> ~/openclaw.log 2>&1 &
+EOF
+chmod +x ~/.termux/boot/openclaw.sh
+
+# Open Termux:Boot once to enable auto-start
+# Then reboot phone to test
+```
+
+### Option 2: tmux (Stay running when Termux closes)
+
+```bash
+# Install tmux
+pkg install tmux
+
+# Start in background session
+tmux new -d -s openclaw 'cd ~/openclaw-lite && npm run dev'
+
+# View logs
+tmux attach -t openclaw
+
+# Detach: Ctrl+B, then D
 ```
 
 ## Configuration
@@ -72,10 +122,8 @@ Set these in your `.env` file or as environment variables:
 Customize your bot's personality by creating a `SOUL.md` file:
 
 ```bash
-# Copy the example
+mkdir -p ~/.openclaw-lite
 cp SOUL.example.md ~/.openclaw-lite/SOUL.md
-
-# Edit to your liking
 nano ~/.openclaw-lite/SOUL.md
 ```
 
@@ -115,13 +163,76 @@ Send these to the bot:
 - `/clear` - Clear conversation history
 - `/status` - Show bot status
 
-## Memory Usage
+## Resource Usage
 
-Designed for 1GB RAM devices:
-- Node.js baseline: ~50MB
-- Baileys (WhatsApp): ~50-100MB
-- Application: ~20MB
-- **Total: ~150-200MB**
+### Memory (RAM)
+
+| Component | Idle | Active |
+|-----------|------|--------|
+| Node.js runtime | ~30MB | ~40MB |
+| Baileys (WhatsApp) | ~40MB | ~80MB |
+| Anthropic SDK | ~5MB | ~10MB |
+| Session cache | ~1MB | ~5MB |
+| **Total** | **~80MB** | **~150MB** |
+
+### Disk
+
+| Item | Size |
+|------|------|
+| node_modules | ~100MB |
+| Application code | ~30KB |
+| WhatsApp auth state | ~50KB |
+| Session files (per chat) | ~2-10KB each |
+
+### API Cost
+
+| Usage | Estimate |
+|-------|----------|
+| Per message (Sonnet) | ~$0.003-0.01 |
+| 100 messages/day | ~$0.30-1.00/day |
+
+### Alcatel 1C Fit
+
+| Resource | Available | Used | Headroom |
+|----------|-----------|------|----------|
+| RAM | 1GB | ~150MB | ~850MB for Android |
+| Storage | 8-16GB | ~100MB | Plenty |
+
+## Production Build
+
+```bash
+# Build TypeScript (faster startup)
+npm run build
+
+# Run compiled version
+npm start
+```
+
+## Troubleshooting
+
+| Issue | Fix |
+|-------|-----|
+| QR won't scan | Delete `~/.openclaw-lite/auth` and restart |
+| "Logged out" | Delete auth folder, restart, re-scan QR |
+| High memory | Reduce `OPENCLAW_MAX_HISTORY` to 20 |
+| API errors | Check `ANTHROPIC_API_KEY` is valid |
+| Termux killed | Enable "Acquire wakelock" in Termux notification |
+
+### Useful Commands
+
+```bash
+# Check if running
+pgrep -f openclaw
+
+# View logs (if using boot script)
+tail -f ~/openclaw.log
+
+# Stop
+pkill -f openclaw
+
+# Check memory usage
+ps aux | grep node
+```
 
 ## Compared to Full OpenClaw
 
@@ -140,7 +251,7 @@ Designed for 1GB RAM devices:
 | Claude intelligence | Yes | Yes |
 | Custom personality | Yes | Yes |
 | Kiosk mode | No | Yes |
-| RAM usage | 500-800MB | 150-200MB |
+| RAM usage | 500-800MB | ~150MB |
 | Install size | 1.5GB+ | ~100MB |
 
 ## License
