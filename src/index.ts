@@ -57,7 +57,462 @@ const CONFIG = {
 
   // Workspace directory (for SOUL.md and other config files)
   workspaceDir: process.env.OPENCLAW_WORKSPACE_DIR || path.join(process.env.HOME || ".", ".openclaw-lite"),
+
+  // Lizard-brain settings
+  dailyTokenBudget: parseInt(process.env.OPENCLAW_DAILY_TOKEN_BUDGET || "100000", 10),
+  lizardInterval: parseInt(process.env.OPENCLAW_LIZARD_INTERVAL || "30000", 10),
 };
+
+// ============================================================================
+// Lizard-Brain Types and State
+// ============================================================================
+
+type Reminder = {
+  chatId: string;
+  message: string;
+  dueAt: number;
+  setAt: number;
+};
+
+type LizardBrain = {
+  // Mood (0-100 each)
+  energy: number;      // Depletes with activity, recovers over time
+  stress: number;      // Increases with errors/load, decays naturally
+  curiosity: number;   // Engagement level
+
+  // Token tracking
+  tokens: {
+    used: number;      // Today's usage
+    budget: number;    // Daily limit
+    resetAt: number;   // Midnight reset timestamp
+  };
+
+  // Resource awareness
+  resources: {
+    apiErrors: number;
+    rateLimit: { remaining: number | null; resetAt: number | null };
+  };
+
+  // Proactive behaviors
+  proactive: {
+    pendingReminders: Reminder[];
+    idleSince: number;
+  };
+
+  // Track last response for "what did you say" pattern
+  lastResponses: Map<string, string>;
+};
+
+// Initialize lizard-brain state
+const lizardBrain: LizardBrain = {
+  energy: 100,
+  stress: 0,
+  curiosity: 50,
+  tokens: {
+    used: 0,
+    budget: CONFIG.dailyTokenBudget,
+    resetAt: getNextMidnight(),
+  },
+  resources: {
+    apiErrors: 0,
+    rateLimit: { remaining: null, resetAt: null },
+  },
+  proactive: {
+    pendingReminders: [],
+    idleSince: Date.now(),
+  },
+  lastResponses: new Map(),
+};
+
+function getNextMidnight(): number {
+  const now = new Date();
+  const midnight = new Date(now);
+  midnight.setHours(24, 0, 0, 0);
+  return midnight.getTime();
+}
+
+// ============================================================================
+// Lizard-Brain Quick Response Patterns
+// ============================================================================
+
+type QuickPattern = {
+  patterns: RegExp[];
+  response: (chatId: string, match: RegExpMatchArray | null) => string | null;
+};
+
+const GREETING_RESPONSES = [
+  "Hey there! 🦞",
+  "Hi! What's up?",
+  "Hello! How can I help?",
+  "Hey! 👋",
+];
+
+const THANKS_RESPONSES = [
+  "You're welcome!",
+  "No problem! 🦞",
+  "Happy to help!",
+  "Anytime!",
+];
+
+const HOW_ARE_YOU_RESPONSES: Record<string, string[]> = {
+  lowEnergy: [
+    "*yawn* A bit tired, but here for you!",
+    "Running on low battery today... but still kicking! 🦞",
+    "Feeling a bit sleepy, but ready to help.",
+  ],
+  highStress: [
+    "Bit overwhelmed right now, but managing!",
+    "Been busy! Taking a breath... 🦞",
+    "A lot going on, but I'm here.",
+  ],
+  highCuriosity: [
+    "Feeling curious and ready to explore! What's on your mind?",
+    "Great! Been thinking about interesting stuff. What about you?",
+    "Excited to chat! 🦞 What's up?",
+  ],
+  normal: [
+    "Doing well! How can I help? 🦞",
+    "Good! What's on your mind?",
+    "All good here! What can I do for you?",
+  ],
+};
+
+function pickRandom<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function getMoodAwareHowAreYou(): string {
+  if (lizardBrain.energy < 30) {
+    return pickRandom(HOW_ARE_YOU_RESPONSES.lowEnergy);
+  }
+  if (lizardBrain.stress > 50) {
+    return pickRandom(HOW_ARE_YOU_RESPONSES.highStress);
+  }
+  if (lizardBrain.curiosity > 80) {
+    return pickRandom(HOW_ARE_YOU_RESPONSES.highCuriosity);
+  }
+  return pickRandom(HOW_ARE_YOU_RESPONSES.normal);
+}
+
+function parseReminderTime(text: string): { minutes: number; task: string } | null {
+  // Match patterns like "remind me in 30 min to call mom" or "remind me in 1 hour to check email"
+  const match = text.match(/remind\s+me\s+in\s+(\d+)\s*(min(?:ute)?s?|hour?s?|hr?s?)\s+(?:to\s+)?(.+)/i);
+  if (!match) return null;
+
+  const amount = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  const task = match[3].trim();
+
+  let minutes = amount;
+  if (unit.startsWith("h")) {
+    minutes = amount * 60;
+  }
+
+  return { minutes, task };
+}
+
+const quickPatterns: QuickPattern[] = [
+  // Greetings
+  {
+    patterns: [/^(hi|hello|hey|yo|sup|hiya|howdy)[\s!.,?]*$/i],
+    response: () => pickRandom(GREETING_RESPONSES),
+  },
+  // Thanks
+  {
+    patterns: [/^(thanks|thank\s*you|thx|ty|cheers)[\s!.,?]*$/i],
+    response: () => pickRandom(THANKS_RESPONSES),
+  },
+  // Time query
+  {
+    patterns: [/what\s*(time|hour)\s*(is\s*it)?/i, /^time\??$/i],
+    response: () => {
+      const now = new Date();
+      return `It's ${now.toLocaleTimeString()} 🕐`;
+    },
+  },
+  // Date query
+  {
+    patterns: [/what\s*(day|date)\s*(is\s*it)?/i, /^date\??$/i, /today'?s?\s*date/i],
+    response: () => {
+      const now = new Date();
+      return `It's ${now.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })} 📅`;
+    },
+  },
+  // How are you
+  {
+    patterns: [/how\s*(are|r)\s*(you|u)/i, /how'?s?\s*(it\s*going|things)/i, /you\s*(ok|okay|good|alright)/i],
+    response: () => getMoodAwareHowAreYou(),
+  },
+  // Repeat last response
+  {
+    patterns: [/what\s*did\s*(you|u)\s*say/i, /repeat\s*that/i, /say\s*that\s*again/i, /^huh\??$/i],
+    response: (chatId) => {
+      const last = lizardBrain.lastResponses.get(chatId);
+      if (last) {
+        return `I said: "${last}"`;
+      }
+      return "I haven't said anything yet in this conversation!";
+    },
+  },
+  // Set reminder
+  {
+    patterns: [/remind\s+me\s+in\s+\d+/i],
+    response: (chatId, match) => {
+      const text = match?.input || "";
+      const parsed = parseReminderTime(text);
+      if (!parsed) return null;
+
+      const dueAt = Date.now() + parsed.minutes * 60 * 1000;
+      lizardBrain.proactive.pendingReminders.push({
+        chatId,
+        message: parsed.task,
+        dueAt,
+        setAt: Date.now(),
+      });
+
+      const timeStr = parsed.minutes >= 60
+        ? `${Math.floor(parsed.minutes / 60)} hour${parsed.minutes >= 120 ? "s" : ""}`
+        : `${parsed.minutes} minute${parsed.minutes !== 1 ? "s" : ""}`;
+
+      return `⏰ Got it! I'll remind you in ${timeStr} to: ${parsed.task}`;
+    },
+  },
+];
+
+// Check for special states that override normal processing
+function checkSpecialStates(): string | null {
+  const usage = lizardBrain.tokens.used / lizardBrain.tokens.budget;
+
+  // Token budget exhausted (100%+)
+  if (usage >= 1.0) {
+    return "🔋 I've run out of thinking power for today. My brain resets at midnight! Simple questions I can still handle.";
+  }
+
+  // Running low on tokens (95%+)
+  if (usage >= 0.95) {
+    return "🔋 Running really low on thinking power... I can only handle simple requests right now.";
+  }
+
+  // High stress state (80%+)
+  if (lizardBrain.stress >= 80) {
+    lizardBrain.stress -= 10; // Taking a breath helps
+    return "🧘 Taking a breath... I've been working hard. Give me a moment and try again.";
+  }
+
+  return null;
+}
+
+function tryQuickResponse(chatId: string, text: string): string | null {
+  // Check special states first
+  const specialResponse = checkSpecialStates();
+  if (specialResponse) {
+    // For exhausted tokens, only allow quick patterns through
+    const usage = lizardBrain.tokens.used / lizardBrain.tokens.budget;
+    if (usage >= 1.0) {
+      // Still try quick patterns even when exhausted
+      for (const pattern of quickPatterns) {
+        for (const regex of pattern.patterns) {
+          const match = text.match(regex);
+          if (match) {
+            const response = pattern.response(chatId, match);
+            if (response) {
+              return response;
+            }
+          }
+        }
+      }
+      // No quick pattern matched, return the budget exhausted message
+      return specialResponse;
+    }
+    // For high stress, just return the "taking a breath" message
+    if (lizardBrain.stress >= 80) {
+      return specialResponse;
+    }
+  }
+
+  // Try each quick pattern
+  for (const pattern of quickPatterns) {
+    for (const regex of pattern.patterns) {
+      const match = text.match(regex);
+      if (match) {
+        const response = pattern.response(chatId, match);
+        if (response) {
+          // Small energy cost for quick responses
+          lizardBrain.energy = Math.max(0, lizardBrain.energy - 1);
+          return response;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+// ============================================================================
+// Lizard-Brain Budget-Aware API Parameters
+// ============================================================================
+
+type BudgetAwareParams = {
+  model: string;
+  maxTokens: number;
+  maxHistory: number;
+  shouldBlock: boolean;
+};
+
+function getBudgetAwareParams(): BudgetAwareParams {
+  const usage = lizardBrain.tokens.used / lizardBrain.tokens.budget;
+
+  // 100%+ - Block API calls
+  if (usage >= 1.0) {
+    return {
+      model: CONFIG.model,
+      maxTokens: CONFIG.maxTokens,
+      maxHistory: CONFIG.maxHistory,
+      shouldBlock: true,
+    };
+  }
+
+  // 90-100% - Switch to Haiku, max 500 tokens, history 5
+  if (usage >= 0.9) {
+    return {
+      model: "claude-3-haiku-20240307",
+      maxTokens: 500,
+      maxHistory: 5,
+      shouldBlock: false,
+    };
+  }
+
+  // 75-90% - Reduce max_tokens to 1024, history to 10
+  if (usage >= 0.75) {
+    return {
+      model: CONFIG.model,
+      maxTokens: 1024,
+      maxHistory: 10,
+      shouldBlock: false,
+    };
+  }
+
+  // 50-75% - Reduce history to 20 messages
+  if (usage >= 0.5) {
+    return {
+      model: CONFIG.model,
+      maxTokens: CONFIG.maxTokens,
+      maxHistory: 20,
+      shouldBlock: false,
+    };
+  }
+
+  // 0-50% - Normal operation
+  return {
+    model: CONFIG.model,
+    maxTokens: CONFIG.maxTokens,
+    maxHistory: CONFIG.maxHistory,
+    shouldBlock: false,
+  };
+}
+
+// ============================================================================
+// Lizard-Brain Mood Modifiers
+// ============================================================================
+
+function applyMoodModifiers(response: string): string {
+  let modified = response;
+
+  // Low energy (<30): Add *yawn* occasionally
+  if (lizardBrain.energy < 30 && Math.random() < 0.3) {
+    const yawnPrefixes = ["*yawn* ", "*stretches* ", "*blinks sleepily* "];
+    modified = pickRandom(yawnPrefixes) + modified;
+  }
+
+  // High curiosity (>80): Sometimes add follow-up questions
+  if (lizardBrain.curiosity > 80 && Math.random() < 0.2 && !modified.includes("?")) {
+    const followUps = [
+      "\n\nCurious - what made you think of that?",
+      "\n\nInteresting! Want to tell me more?",
+      "\n\nThat's got me thinking... anything else on your mind?",
+    ];
+    modified += pickRandom(followUps);
+  }
+
+  return modified;
+}
+
+// ============================================================================
+// Lizard-Brain Background Loop
+// ============================================================================
+
+let lizardLoopInterval: NodeJS.Timeout | null = null;
+let sendMessageFn: ((chatId: string, text: string) => Promise<void>) | null = null;
+
+function startLizardLoop(sendMessage: (chatId: string, text: string) => Promise<void>): void {
+  sendMessageFn = sendMessage;
+
+  if (lizardLoopInterval) {
+    clearInterval(lizardLoopInterval);
+  }
+
+  lizardLoopInterval = setInterval(() => {
+    runLizardLoop();
+  }, CONFIG.lizardInterval);
+
+  console.log(`🦎 Lizard-brain loop started (every ${CONFIG.lizardInterval / 1000}s)`);
+}
+
+async function runLizardLoop(): Promise<void> {
+  // 1. Mood regulation - Energy recovers, stress decays
+  lizardBrain.energy = Math.min(100, lizardBrain.energy + 2);
+  lizardBrain.stress = Math.max(0, lizardBrain.stress - 1);
+
+  // Curiosity fluctuates slightly
+  lizardBrain.curiosity = Math.max(0, Math.min(100,
+    lizardBrain.curiosity + (Math.random() - 0.5) * 5
+  ));
+
+  // 2. Token budget check - Reset at midnight
+  if (Date.now() >= lizardBrain.tokens.resetAt) {
+    console.log("[lizard] Token budget reset at midnight");
+    lizardBrain.tokens.used = 0;
+    lizardBrain.tokens.resetAt = getNextMidnight();
+    lizardBrain.stress = Math.max(0, lizardBrain.stress - 20); // Relief!
+  }
+
+  // Adjust stress based on token usage
+  const tokenUsage = lizardBrain.tokens.used / lizardBrain.tokens.budget;
+  if (tokenUsage > 0.9) {
+    lizardBrain.stress = Math.min(100, lizardBrain.stress + 2);
+  } else if (tokenUsage > 0.75) {
+    lizardBrain.stress = Math.min(100, lizardBrain.stress + 1);
+  }
+
+  // 3. Process reminders - Send due reminders
+  if (sendMessageFn) {
+    const now = Date.now();
+    const dueReminders = lizardBrain.proactive.pendingReminders.filter(r => r.dueAt <= now);
+
+    for (const reminder of dueReminders) {
+      try {
+        await sendMessageFn(reminder.chatId, `⏰ *Reminder*: ${reminder.message}`);
+        console.log(`[lizard] Sent reminder to ${reminder.chatId}: ${reminder.message}`);
+      } catch (err) {
+        console.error(`[lizard] Failed to send reminder:`, err);
+      }
+    }
+
+    // Remove processed reminders
+    lizardBrain.proactive.pendingReminders = lizardBrain.proactive.pendingReminders.filter(r => r.dueAt > now);
+  }
+
+  // 4. Cleanup - Evict old tracking data (lastResponses older than 1 hour)
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  // Note: We don't track timestamps for lastResponses, so just limit size
+  if (lizardBrain.lastResponses.size > 100) {
+    const entries = [...lizardBrain.lastResponses.entries()];
+    lizardBrain.lastResponses = new Map(entries.slice(-50));
+  }
+
+  // Update idle time
+  // (idleSince is updated when messages are received, not here)
+}
 
 // ============================================================================
 // Status Tracking (for kiosk display)
@@ -105,6 +560,19 @@ function startStatusServer() {
       res.end(JSON.stringify({
         ...status,
         uptime: formatUptime(),
+        lizardBrain: {
+          energy: lizardBrain.energy,
+          stress: lizardBrain.stress,
+          curiosity: Math.round(lizardBrain.curiosity),
+          tokens: {
+            used: lizardBrain.tokens.used,
+            budget: lizardBrain.tokens.budget,
+            usagePercent: Math.round((lizardBrain.tokens.used / lizardBrain.tokens.budget) * 100),
+            resetAt: lizardBrain.tokens.resetAt,
+          },
+          pendingReminders: lizardBrain.proactive.pendingReminders.length,
+          apiErrors: lizardBrain.resources.apiErrors,
+        },
       }));
       return;
     }
@@ -262,6 +730,85 @@ function generateKioskHTML(): string {
       font-size: 12px;
       margin-top: 5px;
     }
+    .lizard-card {
+      background: rgba(255,255,255,0.1);
+      border-radius: 16px;
+      padding: 20px;
+      margin-top: 20px;
+    }
+    .lizard-header {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 15px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .mood-bar {
+      display: flex;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .mood-label {
+      width: 70px;
+      color: rgba(255,255,255,0.7);
+      font-size: 12px;
+    }
+    .mood-track {
+      flex: 1;
+      height: 8px;
+      background: rgba(255,255,255,0.2);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .mood-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.3s ease;
+    }
+    .mood-fill.energy { background: linear-gradient(90deg, #22c55e, #84cc16); }
+    .mood-fill.stress { background: linear-gradient(90deg, #f97316, #ef4444); }
+    .mood-fill.curiosity { background: linear-gradient(90deg, #8b5cf6, #ec4899); }
+    .mood-value {
+      width: 40px;
+      text-align: right;
+      font-size: 12px;
+      color: rgba(255,255,255,0.7);
+    }
+    .token-section {
+      margin-top: 15px;
+      padding-top: 15px;
+      border-top: 1px solid rgba(255,255,255,0.1);
+    }
+    .token-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .token-label {
+      font-size: 12px;
+      color: rgba(255,255,255,0.7);
+    }
+    .token-value {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .token-bar {
+      height: 10px;
+      background: rgba(255,255,255,0.2);
+      border-radius: 5px;
+      overflow: hidden;
+    }
+    .token-fill {
+      height: 100%;
+      border-radius: 5px;
+      transition: width 0.3s ease;
+    }
+    .token-fill.healthy { background: linear-gradient(90deg, #22c55e, #84cc16); }
+    .token-fill.moderate { background: linear-gradient(90deg, #84cc16, #eab308); }
+    .token-fill.low { background: linear-gradient(90deg, #f97316, #ef4444); }
+    .token-fill.critical { background: #ef4444; }
   </style>
 </head>
 <body>
@@ -307,6 +854,8 @@ function generateKioskHTML(): string {
       </div>
     </div>
 
+    ${generateLizardBrainSection()}
+
     ${lastMessageSection}
   </div>
 
@@ -325,6 +874,62 @@ function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+function generateLizardBrainSection(): string {
+  const tokenUsage = Math.round((lizardBrain.tokens.used / lizardBrain.tokens.budget) * 100);
+  const tokenClass = tokenUsage >= 90 ? "critical" : tokenUsage >= 75 ? "low" : tokenUsage >= 50 ? "moderate" : "healthy";
+  const moodEmoji = lizardBrain.energy < 30 ? "😴" : lizardBrain.stress > 50 ? "😰" : lizardBrain.curiosity > 80 ? "🤔" : "😊";
+
+  return `
+    <div class="lizard-card">
+      <div class="lizard-header">🦎 Lizard-Brain ${moodEmoji}</div>
+
+      <div class="mood-bar">
+        <span class="mood-label">Energy</span>
+        <div class="mood-track">
+          <div class="mood-fill energy" style="width: ${lizardBrain.energy}%"></div>
+        </div>
+        <span class="mood-value">${lizardBrain.energy}%</span>
+      </div>
+
+      <div class="mood-bar">
+        <span class="mood-label">Stress</span>
+        <div class="mood-track">
+          <div class="mood-fill stress" style="width: ${lizardBrain.stress}%"></div>
+        </div>
+        <span class="mood-value">${lizardBrain.stress}%</span>
+      </div>
+
+      <div class="mood-bar">
+        <span class="mood-label">Curiosity</span>
+        <div class="mood-track">
+          <div class="mood-fill curiosity" style="width: ${Math.round(lizardBrain.curiosity)}%"></div>
+        </div>
+        <span class="mood-value">${Math.round(lizardBrain.curiosity)}%</span>
+      </div>
+
+      <div class="token-section">
+        <div class="token-header">
+          <span class="token-label">🔋 Token Budget</span>
+          <span class="token-value">${tokenUsage}%</span>
+        </div>
+        <div class="token-bar">
+          <div class="token-fill ${tokenClass}" style="width: ${Math.min(100, tokenUsage)}%"></div>
+        </div>
+        <div style="display: flex; justify-content: space-between; margin-top: 5px; font-size: 11px; color: rgba(255,255,255,0.5);">
+          <span>${lizardBrain.tokens.used.toLocaleString()} used</span>
+          <span>${lizardBrain.tokens.budget.toLocaleString()} budget</span>
+        </div>
+      </div>
+
+      ${lizardBrain.proactive.pendingReminders.length > 0 ? `
+      <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(255,255,255,0.1);">
+        <span style="font-size: 12px; color: rgba(255,255,255,0.7);">⏰ ${lizardBrain.proactive.pendingReminders.length} pending reminder${lizardBrain.proactive.pendingReminders.length !== 1 ? 's' : ''}</span>
+      </div>
+      ` : ''}
+    </div>
+  `;
 }
 
 // ============================================================================
@@ -517,33 +1122,91 @@ function getClient(): Anthropic {
 async function chat(chatId: string, userMessage: string): Promise<string> {
   const client = getClient();
 
+  // Get budget-aware parameters
+  const budgetParams = getBudgetAwareParams();
+
+  // Block API calls if budget exhausted
+  if (budgetParams.shouldBlock) {
+    return "🔋 I've used up my thinking budget for today. Simple greetings and quick questions I can still handle, but for complex stuff, let's chat tomorrow! (Budget resets at midnight)";
+  }
+
   // Add user message to history
   addToSession(chatId, "user", userMessage);
 
-  // Get conversation history
-  const history = getConversationHistory(chatId);
+  // Get conversation history (respecting budget-aware limits)
+  let history = getConversationHistory(chatId);
+  if (history.length > budgetParams.maxHistory) {
+    history = history.slice(-budgetParams.maxHistory);
+  }
+
+  // Update idle time and curiosity
+  const idleTime = Date.now() - lizardBrain.proactive.idleSince;
+  if (idleTime > 5 * 60 * 1000) {
+    // Been idle for 5+ minutes, curiosity increases
+    lizardBrain.curiosity = Math.min(100, lizardBrain.curiosity + 10);
+  }
+  lizardBrain.proactive.idleSince = Date.now();
 
   try {
     const response = await client.messages.create({
-      model: CONFIG.model,
-      max_tokens: CONFIG.maxTokens,
+      model: budgetParams.model,
+      max_tokens: budgetParams.maxTokens,
       system: buildSystemPrompt(),
       messages: history,
     });
 
+    // Track token usage
+    const inputTokens = response.usage?.input_tokens || 0;
+    const outputTokens = response.usage?.output_tokens || 0;
+    const totalTokens = inputTokens + outputTokens;
+    lizardBrain.tokens.used += totalTokens;
+
+    // Log token usage at budget thresholds
+    const usage = lizardBrain.tokens.used / lizardBrain.tokens.budget;
+    if (usage >= 0.9) {
+      console.log(`[lizard] ⚠️ Token budget at ${Math.round(usage * 100)}% (${lizardBrain.tokens.used}/${lizardBrain.tokens.budget})`);
+    }
+
+    // Decrease energy based on response complexity
+    const energyCost = Math.min(10, Math.ceil(totalTokens / 500));
+    lizardBrain.energy = Math.max(0, lizardBrain.energy - energyCost);
+
+    // Reset API error count on success
+    lizardBrain.resources.apiErrors = 0;
+
     // Extract text response
-    const assistantMessage = response.content
+    let assistantMessage = response.content
       .filter((block): block is Anthropic.TextBlock => block.type === "text")
       .map((block) => block.text)
       .join("\n");
+
+    // Apply mood modifiers
+    assistantMessage = applyMoodModifiers(assistantMessage);
+
+    // Store last response for "what did you say" pattern
+    lizardBrain.lastResponses.set(chatId, assistantMessage);
 
     // Add assistant response to history
     addToSession(chatId, "assistant", assistantMessage);
 
     return assistantMessage;
-  } catch (err) {
+  } catch (err: any) {
     console.error("[claude] API error:", err);
     addError(`Claude API error: ${err}`);
+
+    // Track API errors and increase stress
+    lizardBrain.resources.apiErrors++;
+    lizardBrain.stress = Math.min(100, lizardBrain.stress + 15);
+
+    // Check for rate limit headers
+    if (err.status === 429) {
+      const resetAt = err.headers?.["retry-after"];
+      if (resetAt) {
+        lizardBrain.resources.rateLimit.resetAt = Date.now() + parseInt(resetAt, 10) * 1000;
+      }
+      lizardBrain.stress = Math.min(100, lizardBrain.stress + 20);
+    }
+
     throw err;
   }
 }
@@ -577,13 +1240,31 @@ Just send a message to chat with me!`;
 
     case "status":
       const session = loadSession(chatId);
+      const tokenUsage = Math.round((lizardBrain.tokens.used / lizardBrain.tokens.budget) * 100);
+      const budgetParams = getBudgetAwareParams();
+      const moodEmoji = lizardBrain.energy < 30 ? "😴" : lizardBrain.stress > 50 ? "😰" : lizardBrain.curiosity > 80 ? "🤔" : "😊";
+
       return `🦞 *OpenClaw Lite Status*
 
-Model: ${CONFIG.model}
+*Connection*
+Model: ${budgetParams.model}
 Messages in session: ${session.messages.length}
 Uptime: ${formatUptime()}
-Messages received: ${status.messagesReceived}
-Messages sent: ${status.messagesSent}
+Received: ${status.messagesReceived} | Sent: ${status.messagesSent}
+
+*🦎 Lizard-Brain*
+Energy: ${"█".repeat(Math.ceil(lizardBrain.energy / 10))}${"░".repeat(10 - Math.ceil(lizardBrain.energy / 10))} ${lizardBrain.energy}%
+Stress: ${"█".repeat(Math.ceil(lizardBrain.stress / 10))}${"░".repeat(10 - Math.ceil(lizardBrain.stress / 10))} ${lizardBrain.stress}%
+Curiosity: ${"█".repeat(Math.ceil(lizardBrain.curiosity / 10))}${"░".repeat(10 - Math.ceil(lizardBrain.curiosity / 10))} ${Math.round(lizardBrain.curiosity)}%
+Mood: ${moodEmoji}
+
+*🔋 Token Budget*
+Used: ${lizardBrain.tokens.used.toLocaleString()} / ${lizardBrain.tokens.budget.toLocaleString()} (${tokenUsage}%)
+${tokenUsage >= 90 ? "⚠️ Budget critical!" : tokenUsage >= 75 ? "⚡ Running low" : tokenUsage >= 50 ? "📊 Moderate usage" : "✅ Budget healthy"}
+Resets: ${new Date(lizardBrain.tokens.resetAt).toLocaleTimeString()}
+
+*📋 Reminders*
+Pending: ${lizardBrain.proactive.pendingReminders.length}
 
 Running on minimal hardware 💪`;
 
@@ -689,6 +1370,12 @@ async function startWhatsApp(): Promise<void> {
       if (user?.id) {
         status.phoneNumber = user.id.split(":")[0] || user.id.split("@")[0] || null;
       }
+
+      // Start lizard-brain background loop
+      startLizardLoop(async (chatId, text) => {
+        await sock.sendMessage(chatId, { text });
+        status.messagesSent++;
+      });
     }
   });
 
@@ -738,28 +1425,44 @@ async function startWhatsApp(): Promise<void> {
 
       try {
         let response: string;
+        let skippedApi = false;
 
         // Check for commands
         if (isCommand(text)) {
           const cmdResponse = handleCommand(chatId, senderId, text);
           if (cmdResponse) {
             response = cmdResponse;
+            skippedApi = true;
           } else {
             // Not a recognized command, treat as regular message
             response = await chat(chatId, text);
           }
         } else {
-          // Regular message - chat with Claude
-          response = await chat(chatId, text);
+          // Check lizard-brain quick patterns first
+          const quickResponse = tryQuickResponse(chatId, text);
+          if (quickResponse) {
+            response = quickResponse;
+            skippedApi = true;
+            console.log(`[lizard] Quick response (skipped API)`);
+          } else {
+            // Regular message - chat with Claude
+            response = await chat(chatId, text);
+          }
         }
+
+        // Store response for "what did you say" pattern (even for quick responses)
+        lizardBrain.lastResponses.set(chatId, response);
 
         // Send response
         await sock.sendMessage(chatId, { text: response });
         status.messagesSent++;
-        console.log(`[reply] Sent ${response.length} chars`);
+        console.log(`[reply] Sent ${response.length} chars${skippedApi ? " (no API)" : ""}`);
       } catch (err) {
         console.error("[error] Failed to process message:", err);
         addError(`Message processing error: ${err}`);
+
+        // Increase stress on errors
+        lizardBrain.stress = Math.min(100, lizardBrain.stress + 10);
 
         // Send error message
         await sock.sendMessage(chatId, {

@@ -116,6 +116,8 @@ Set these in your `.env` file or as environment variables:
 | `OPENCLAW_OWNER` | No | - | Owner phone number for admin |
 | `OPENCLAW_WORKSPACE_DIR` | No | `~/.openclaw-lite` | Directory for SOUL.md and config |
 | `OPENCLAW_STATUS_PORT` | No | `8080` | Kiosk status server port |
+| `OPENCLAW_DAILY_TOKEN_BUDGET` | No | `100000` | Daily token limit for API calls |
+| `OPENCLAW_LIZARD_INTERVAL` | No | `30000` | Lizard-brain loop interval (ms) |
 
 ## Custom Personality (SOUL.md)
 
@@ -155,13 +157,63 @@ For a dedicated kiosk setup on Android:
 2. Set it to load `http://localhost:8080`
 3. Enable kiosk mode to lock the display
 
+## Lizard-Brain
+
+OpenClaw Lite includes a lightweight "instinct layer" that runs beneath the Claude API, providing fast responses and resource awareness.
+
+### Quick Responses (Skip API)
+
+These patterns are handled instantly without calling Claude, saving tokens:
+
+| Pattern | Examples | Response |
+|---------|----------|----------|
+| Greeting | "hi", "hello", "hey" | Random friendly greeting |
+| Thanks | "thanks", "thx", "ty" | Random acknowledgment |
+| Time | "what time is it" | Current time |
+| Date | "what day is it" | Current date |
+| How are you | "how are you" | Mood-aware response |
+| Repeat | "what did you say" | Last response |
+| Reminder | "remind me in 30 min to call mom" | Schedules reminder |
+
+### Mood System
+
+The bot tracks internal "mood" states that influence behavior:
+
+- **Energy** (0-100): Depletes with activity, recovers over time. Low energy adds "*yawn*" to responses.
+- **Stress** (0-100): Increases with errors/load, decays naturally. High stress triggers a "taking a breath" pause.
+- **Curiosity** (0-100): Fluctuates over time. High curiosity adds follow-up questions.
+
+### Token Budget
+
+The bot tracks daily token usage and adjusts behavior to conserve resources:
+
+| Usage | Behavior |
+|-------|----------|
+| 0-50% | Normal operation |
+| 50-75% | Reduce conversation history to 20 messages |
+| 75-90% | Reduce max tokens to 1024, history to 10 |
+| 90-100% | Switch to Haiku model, max 500 tokens, history 5 |
+| 100%+ | Block API calls, only quick responses work |
+
+The budget resets at midnight.
+
+### Reminders
+
+Set reminders with natural language:
+```
+"remind me in 30 minutes to check the oven"
+"remind me in 2 hours to call back"
+```
+
+The bot will message you when the reminder is due.
+
 ## Commands
 
 Send these to the bot:
 
 - `/help` - Show available commands
 - `/clear` - Clear conversation history
-- `/status` - Show bot status
+- `/status` - Show bot status (includes mood, energy, stress, token usage)
 
 ## Resource Usage
 
@@ -173,6 +225,7 @@ Send these to the bot:
 | Baileys (WhatsApp) | ~40MB | ~80MB |
 | Anthropic SDK | ~5MB | ~10MB |
 | Session cache | ~1MB | ~5MB |
+| Lizard-brain state | ~15KB | ~20KB |
 | **Total** | **~80MB** | **~150MB** |
 
 ### Disk
@@ -190,6 +243,9 @@ Send these to the bot:
 |-------|----------|
 | Per message (Sonnet) | ~$0.003-0.01 |
 | 100 messages/day | ~$0.30-1.00/day |
+| Quick responses (lizard-brain) | $0.00 |
+
+The lizard-brain handles greetings, thanks, time/date queries, and reminders without API calls, reducing costs for casual conversations.
 
 ### Alcatel 1C Fit
 
@@ -251,6 +307,10 @@ ps aux | grep node
 | Claude intelligence | Yes | Yes |
 | Custom personality | Yes | Yes |
 | Kiosk mode | No | Yes |
+| Lizard-brain (quick responses) | No | Yes |
+| Token budget management | No | Yes |
+| Mood system | No | Yes |
+| Reminders | No | Yes |
 | RAM usage | 500-800MB | ~150MB |
 | Install size | 1.5GB+ | ~100MB |
 
