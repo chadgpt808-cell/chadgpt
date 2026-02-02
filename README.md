@@ -116,6 +116,7 @@ Set these in your `.env` file or as environment variables:
 | `OPENCLAW_OWNER` | No | - | Owner phone number for admin |
 | `OPENCLAW_WORKSPACE_DIR` | No | `~/.openclaw-lite` | Directory for SOUL.md and config |
 | `OPENCLAW_STATUS_PORT` | No | `8080` | Kiosk status server port |
+| `OPENCLAW_STATUS_BIND` | No | `127.0.0.1` | Bind address (`0.0.0.0` for external access) |
 | `OPENCLAW_DAILY_TOKEN_BUDGET` | No | `100000` | Daily token limit for API calls |
 | `OPENCLAW_LIZARD_INTERVAL` | No | `30000` | Lizard-brain loop interval (ms) |
 
