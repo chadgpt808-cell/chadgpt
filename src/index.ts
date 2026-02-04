@@ -2039,6 +2039,148 @@ type Session = {
   lastActivity: number;
 };
 
+// ============================================================================
+// Long-Term Memory (Facts + Summaries)
+// ============================================================================
+
+type UserMemory = {
+  facts: string[];           // Key facts about the user
+  summary: string | null;    // Summary of older conversations
+  summaryUpTo: number;       // Timestamp of last summarized message
+  lastUpdated: number;
+};
+
+function getMemoryPath(chatId: string): string {
+  const safeId = chatId.replace(/[^a-zA-Z0-9]/g, "_");
+  return path.join(CONFIG.workspaceDir, "memory", `${safeId}.json`);
+}
+
+function loadMemory(chatId: string): UserMemory {
+  try {
+    const data = fs.readFileSync(getMemoryPath(chatId), "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return { facts: [], summary: null, summaryUpTo: 0, lastUpdated: 0 };
+  }
+}
+
+function saveMemory(chatId: string, memory: UserMemory): void {
+  fs.mkdirSync(path.join(CONFIG.workspaceDir, "memory"), { recursive: true });
+  fs.writeFileSync(getMemoryPath(chatId), JSON.stringify(memory));
+}
+
+async function extractFacts(chatId: string, conversation: string): Promise<string[]> {
+  const client = getClient();
+  const memory = loadMemory(chatId);
+
+  try {
+    const response = await client.messages.create({
+      model: "claude-3-haiku-20240307",
+      max_tokens: 500,
+      system: "Extract key facts about the user from this conversation. Return only new facts not already known. Format: one fact per line, no numbering. Focus on: name, preferences, important dates, relationships, location, work, interests. If no new facts, return NONE.",
+      messages: [
+        { role: "user", content: `Known facts:\n${memory.facts.join("\n") || "None"}\n\nConversation:\n${conversation}` }
+      ],
+    });
+
+    // Track token usage
+    const tokens = (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
+    lizardBrain.tokens.used += tokens;
+
+    const text = response.content[0].type === "text" ? response.content[0].text : "";
+    if (text.trim() === "NONE" || text.trim().length === 0) return [];
+
+    return text.split("\n").filter(f => f.trim().length > 0 && f.trim() !== "NONE");
+  } catch (err) {
+    console.error("[memory] Failed to extract facts:", err);
+    return [];
+  }
+}
+
+async function summarizeConversation(oldSummary: string | null, messages: string[]): Promise<string | null> {
+  const client = getClient();
+
+  try {
+    const response = await client.messages.create({
+      model: "claude-3-haiku-20240307",
+      max_tokens: 500,
+      system: "Create a brief summary of these conversations. Include key topics discussed, decisions made, and any commitments. Be concise (under 200 words). Focus on what would be useful context for future conversations.",
+      messages: [
+        { role: "user", content: `${oldSummary ? `Previous summary:\n${oldSummary}\n\n` : ""}New messages:\n${messages.join("\n")}` }
+      ],
+    });
+
+    // Track token usage
+    const tokens = (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
+    lizardBrain.tokens.used += tokens;
+
+    return response.content[0].type === "text" ? response.content[0].text : null;
+  } catch (err) {
+    console.error("[memory] Failed to summarize:", err);
+    return null;
+  }
+}
+
+async function updateMemoryIfNeeded(chatId: string): Promise<void> {
+  // Don't update memory if API is unavailable
+  if (!CONFIG.apiKey) return;
+
+  const session = loadSession(chatId);
+  const messageCount = session.messages.length;
+
+  // Extract facts every 10 messages
+  if (messageCount > 0 && messageCount % 10 === 0) {
+    const recentMessages = session.messages.slice(-10)
+      .map(m => `${m.role}: ${m.content}`).join("\n");
+
+    const newFacts = await extractFacts(chatId, recentMessages);
+    if (newFacts.length > 0) {
+      const memory = loadMemory(chatId);
+      memory.facts = [...memory.facts, ...newFacts].slice(-20); // Keep max 20 facts
+      memory.lastUpdated = Date.now();
+      saveMemory(chatId, memory);
+      console.log(`[memory] Extracted ${newFacts.length} new facts for ${chatId}`);
+    }
+  }
+
+  // Summarize when history exceeds 30 messages
+  if (messageCount > 30) {
+    const memory = loadMemory(chatId);
+    const oldMessages = session.messages.slice(0, -20); // Keep last 20 unsummarized
+
+    const toSummarize = oldMessages
+      .filter(m => m.timestamp > memory.summaryUpTo)
+      .map(m => `${m.role}: ${m.content}`);
+
+    if (toSummarize.length > 10) {
+      const newSummary = await summarizeConversation(memory.summary, toSummarize);
+      if (newSummary) {
+        memory.summary = newSummary;
+        memory.summaryUpTo = oldMessages[oldMessages.length - 1].timestamp;
+        memory.lastUpdated = Date.now();
+        saveMemory(chatId, memory);
+        console.log(`[memory] Updated summary for ${chatId}`);
+      }
+    }
+  }
+}
+
+function buildMemoryContext(chatId: string): string {
+  const memory = loadMemory(chatId);
+  if (memory.facts.length === 0 && !memory.summary) {
+    return "";
+  }
+
+  let context = "\n\n## What you remember about this user\n";
+  if (memory.facts.length > 0) {
+    context += `Facts: ${memory.facts.join("; ")}\n`;
+  }
+  if (memory.summary) {
+    context += `Previous conversations: ${memory.summary}\n`;
+  }
+  return context;
+}
+
 const sessions = new Map<string, Session>();
 const pendingSaves = new Set<string>();
 const MAX_CACHED_SESSIONS = 20; // Limit memory usage
@@ -2224,10 +2366,13 @@ async function chat(chatId: string, userMessage: string, image?: ImageContent): 
       { role: "user", content: currentContent },
     ];
 
+    // Build system prompt with memory context
+    const systemPrompt = buildSystemPrompt() + buildMemoryContext(chatId);
+
     const response = await client.messages.create({
       model: budgetParams.model,
       max_tokens: budgetParams.maxTokens,
-      system: buildSystemPrompt(),
+      system: systemPrompt,
       messages,
       tools: CONFIG.tavilyApiKey ? tools : undefined,
     });
@@ -2258,7 +2403,7 @@ async function chat(chatId: string, userMessage: string, image?: ImageContent): 
       finalResponse = await client.messages.create({
         model: budgetParams.model,
         max_tokens: budgetParams.maxTokens,
-        system: buildSystemPrompt(),
+        system: systemPrompt,
         messages: [
           ...messages,
           { role: "assistant", content: finalResponse.content },
@@ -2346,6 +2491,8 @@ function handleCommand(chatId: string, senderId: string, text: string): string |
 
 /clear - Clear conversation history
 /status - Show bot status
+/remember - Show what I remember about you
+/forget - Clear my memory of you
 /help - Show this help
 
 Just send a message to chat with me!`;
@@ -2379,6 +2526,24 @@ Resets: ${new Date(lizardBrain.tokens.resetAt).toLocaleTimeString()}
 Pending: ${lizardBrain.proactive.pendingReminders.length}
 
 Running on minimal hardware 💪`;
+
+    case "remember":
+      const mem = loadMemory(chatId);
+      if (mem.facts.length === 0 && !mem.summary) {
+        return "🧠 I don't have any memories about you yet. Keep chatting and I'll learn!";
+      }
+      let memoryReport = "🧠 *What I remember:*\n\n";
+      if (mem.facts.length > 0) {
+        memoryReport += "*Facts:*\n" + mem.facts.map(f => `• ${f}`).join("\n") + "\n\n";
+      }
+      if (mem.summary) {
+        memoryReport += "*Our history:*\n" + mem.summary;
+      }
+      return memoryReport;
+
+    case "forget":
+      saveMemory(chatId, { facts: [], summary: null, summaryUpTo: 0, lastUpdated: 0 });
+      return "🧠 Done! I've forgotten everything about you. Fresh start!";
 
     default:
       return null; // Not a recognized command, treat as regular message
@@ -2605,6 +2770,13 @@ async function startWhatsApp(): Promise<void> {
         await sock.sendMessage(chatId, { text: response });
         status.messagesSent++;
         console.log(`[reply] Sent ${response.length} chars${skippedApi ? " (no API)" : ""}`);
+
+        // Update long-term memory in background (only after API calls)
+        if (!skippedApi) {
+          updateMemoryIfNeeded(chatId).catch(err => {
+            console.error("[memory] Background update failed:", err);
+          });
+        }
       } catch (err) {
         console.error("[error] Failed to process message:", err);
         addError(`Message processing error: ${err}`);
