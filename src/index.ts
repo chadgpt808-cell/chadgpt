@@ -19,6 +19,7 @@ import qrcode from "qrcode-terminal";
 import * as fs from "fs";
 import * as path from "path";
 import * as http from "http";
+import mammoth from "mammoth";
 import "dotenv/config";
 
 // ============================================================================
@@ -669,6 +670,124 @@ async function downloadImage(msg: WAMessage): Promise<ImageContent | null> {
   } catch (err) {
     console.error("[image] Failed to download:", err);
     return null;
+  }
+}
+
+// ============================================================================
+// Document Processing
+// ============================================================================
+
+type DocumentContent =
+  | { kind: "pdf"; data: string }
+  | { kind: "text"; data: string }
+  | { kind: "image"; data: string; mimeType: string };
+
+type MediaContent =
+  | { type: "image"; image: ImageContent }
+  | { type: "document"; document: DocumentContent; fileName: string };
+
+const DOC_SIZE_LIMITS: Record<string, number> = {
+  pdf: 10 * 1024 * 1024,
+  text: 1 * 1024 * 1024,
+  docx: 5 * 1024 * 1024,
+  image: 5 * 1024 * 1024,
+};
+
+const TEXT_MIME_TYPES = new Set([
+  "text/plain", "text/csv", "text/markdown", "text/html", "text/xml",
+  "application/json", "application/xml", "text/javascript", "application/javascript",
+]);
+
+const IMAGE_MIME_TYPES = new Set([
+  "image/jpeg", "image/png", "image/gif", "image/webp",
+]);
+
+const DOCX_MIME_TYPE =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+async function downloadDocument(
+  msg: WAMessage
+): Promise<{ content: DocumentContent; fileName: string } | string> {
+  const docMsg =
+    msg.message?.documentMessage ||
+    (msg.message as any)?.documentWithCaptionMessage?.message?.documentMessage;
+
+  if (!docMsg) return "Could not read document message.";
+
+  const mimeType = docMsg.mimetype || "application/octet-stream";
+  const fileName = docMsg.fileName || "unknown";
+  const fileSize = Number(docMsg.fileLength || 0);
+
+  // Images sent as document attachments
+  if (IMAGE_MIME_TYPES.has(mimeType)) {
+    if (fileSize > DOC_SIZE_LIMITS.image) {
+      return `That image is too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max is ${DOC_SIZE_LIMITS.image / 1024 / 1024}MB.`;
+    }
+    try {
+      const buffer = await downloadMediaMessage(msg, "buffer", {});
+      return { content: { kind: "image", data: (buffer as Buffer).toString("base64"), mimeType }, fileName };
+    } catch (err) {
+      console.error("[doc] Failed to download image document:", err);
+      return "Failed to download the image.";
+    }
+  }
+
+  // PDF files
+  if (mimeType === "application/pdf") {
+    if (fileSize > DOC_SIZE_LIMITS.pdf) {
+      return `That PDF is too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max is ${DOC_SIZE_LIMITS.pdf / 1024 / 1024}MB.`;
+    }
+    try {
+      const buffer = await downloadMediaMessage(msg, "buffer", {});
+      return { content: { kind: "pdf", data: (buffer as Buffer).toString("base64") }, fileName };
+    } catch (err) {
+      console.error("[doc] Failed to download PDF:", err);
+      return "Failed to download the PDF.";
+    }
+  }
+
+  // Text-based files
+  if (TEXT_MIME_TYPES.has(mimeType) || fileName.match(/\.(txt|csv|json|xml|html|md|log|yml|yaml|toml|ini|cfg|conf|sh|py|js|ts)$/i)) {
+    if (fileSize > DOC_SIZE_LIMITS.text) {
+      return `That file is too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max for text files is ${DOC_SIZE_LIMITS.text / 1024 / 1024}MB.`;
+    }
+    try {
+      const buffer = await downloadMediaMessage(msg, "buffer", {});
+      return { content: { kind: "text", data: (buffer as Buffer).toString("utf-8") }, fileName };
+    } catch (err) {
+      console.error("[doc] Failed to download text file:", err);
+      return "Failed to download the text file.";
+    }
+  }
+
+  // Word documents (.docx)
+  if (mimeType === DOCX_MIME_TYPE || fileName.match(/\.docx$/i)) {
+    if (fileSize > DOC_SIZE_LIMITS.docx) {
+      return `That Word document is too large (${(fileSize / 1024 / 1024).toFixed(1)}MB). Max is ${DOC_SIZE_LIMITS.docx / 1024 / 1024}MB.`;
+    }
+    try {
+      const buffer = await downloadMediaMessage(msg, "buffer", {});
+      const result = await mammoth.extractRawText({ buffer: buffer as Buffer });
+      if (!result.value || result.value.trim().length === 0) {
+        return "That Word document appears to be empty or contains only images/charts (no extractable text).";
+      }
+      return { content: { kind: "text", data: result.value }, fileName };
+    } catch (err) {
+      console.error("[doc] Failed to process DOCX:", err);
+      return "Failed to read the Word document. It might be corrupted or password-protected.";
+    }
+  }
+
+  // Unsupported format
+  const ext = path.extname(fileName).toLowerCase();
+  return `I can't process ${ext || mimeType} files yet. I support: PDF, text files (.txt, .csv, .json, .xml, .html, .md), and Word (.docx).`;
+}
+
+function estimateDocumentTokens(doc: DocumentContent): number {
+  switch (doc.kind) {
+    case "pdf": return Math.ceil(doc.data.length / 4);
+    case "text": return Math.ceil(doc.data.length * 0.25);
+    case "image": return 1600;
   }
 }
 
@@ -2009,6 +2128,7 @@ ${personalitySection}
 - Answer questions and have conversations
 - Help with tasks, planning, and problem-solving
 - Provide information and explanations
+- Analyze images and documents (PDF, text files, Word .docx)
 - Be a thoughtful companion
 
 ## Guidelines
@@ -2307,7 +2427,7 @@ const tools: Anthropic.Tool[] = [
   },
 ];
 
-async function chat(chatId: string, userMessage: string, image?: ImageContent): Promise<string> {
+async function chat(chatId: string, userMessage: string, media?: MediaContent): Promise<string> {
   const client = getClient();
 
   // Get budget-aware parameters
@@ -2324,7 +2444,12 @@ async function chat(chatId: string, userMessage: string, image?: ImageContent): 
   }
 
   // Add user message to history (text representation only)
-  addToSession(chatId, "user", userMessage || "[Image]");
+  const historyText = media?.type === "document"
+    ? `[Document: ${media.fileName}] ${userMessage || ""}`
+    : media?.type === "image"
+      ? userMessage || "[Image]"
+      : userMessage;
+  addToSession(chatId, "user", historyText);
 
   // Get conversation history (respecting budget-aware limits)
   let history = getConversationHistory(chatId);
@@ -2341,20 +2466,57 @@ async function chat(chatId: string, userMessage: string, image?: ImageContent): 
   lizardBrain.proactive.idleSince = Date.now();
 
   try {
-    // Build message content (text-only or with image for vision)
+    // Build message content (text-only, with image, or with document)
     let currentContent: Anthropic.MessageParam["content"];
-    if (image) {
+    if (media?.type === "image") {
       currentContent = [
         {
           type: "image",
           source: {
             type: "base64",
-            media_type: image.mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
-            data: image.data,
+            media_type: media.image.mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+            data: media.image.data,
           },
         },
         { type: "text", text: userMessage || "What's in this image?" },
       ];
+    } else if (media?.type === "document") {
+      const doc = media.document;
+      const defaultPrompt = `I've shared a file: "${media.fileName}". Please review it.`;
+
+      if (doc.kind === "pdf") {
+        currentContent = [
+          {
+            type: "document",
+            source: { type: "base64", media_type: "application/pdf" as const, data: doc.data },
+            title: media.fileName,
+          } as Anthropic.DocumentBlockParam,
+          { type: "text", text: userMessage || defaultPrompt },
+        ];
+      } else if (doc.kind === "text") {
+        currentContent = [
+          {
+            type: "document",
+            source: { type: "text" as const, media_type: "text/plain" as const, data: doc.data },
+            title: media.fileName,
+          } as Anthropic.DocumentBlockParam,
+          { type: "text", text: userMessage || defaultPrompt },
+        ];
+      } else if (doc.kind === "image") {
+        currentContent = [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: doc.mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+              data: doc.data,
+            },
+          },
+          { type: "text", text: userMessage || "What's in this image?" },
+        ];
+      } else {
+        currentContent = userMessage || defaultPrompt;
+      }
     } else {
       currentContent = userMessage;
     }
@@ -2681,24 +2843,35 @@ async function startWhatsApp(): Promise<void> {
         continue;
       }
 
-      // Extract text and/or image content
+      // Extract text, image, and document content
       const imageMessage = msg.message?.imageMessage;
+      const docMessage =
+        msg.message?.documentMessage ||
+        (msg.message as any)?.documentWithCaptionMessage?.message?.documentMessage;
+
       const text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
-        imageMessage?.caption ||  // Image caption
+        imageMessage?.caption ||
+        docMessage?.caption ||
+        (msg.message as any)?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
         "";
 
-      // Check if this is an image message
       const hasImage = !!imageMessage;
+      const hasDocument = !!docMessage;
 
-      // Skip if no text AND no image
-      if (!text && !hasImage) continue;
+      // Skip if no text AND no media
+      if (!text && !hasImage && !hasDocument) continue;
 
       status.messagesReceived++;
+      const mediaLabel = hasDocument
+        ? `[Doc: ${docMessage?.fileName || "file"}]`
+        : hasImage ? "[Image]" : "";
       status.lastMessage = {
         from: senderId.replace(/@.*$/, ""),
-        preview: hasImage ? "[Image] " + text.slice(0, 40) : text.slice(0, 50) + (text.length > 50 ? "..." : ""),
+        preview: mediaLabel
+          ? mediaLabel + " " + text.slice(0, 40)
+          : text.slice(0, 50) + (text.length > 50 ? "..." : ""),
         time: Date.now(),
       };
 
@@ -2706,57 +2879,76 @@ async function startWhatsApp(): Promise<void> {
       status.activity = "receiving";
       status.activityUntil = Date.now() + 2000;
 
-      console.log(`[message] ${senderId}: ${hasImage ? "[Image] " : ""}${text.slice(0, 50)}${text.length > 50 ? "..." : ""}`);
+      console.log(`[message] ${senderId}: ${mediaLabel}${text.slice(0, 50)}${text.length > 50 ? "..." : ""}`);
 
       try {
         let response: string;
         let skippedApi = false;
 
         // Download image if present
-        let imageContent: ImageContent | undefined;
+        let mediaContent: MediaContent | undefined;
         if (hasImage) {
           console.log(`[image] Downloading image from ${senderId}`);
           const downloaded = await downloadImage(msg);
           if (downloaded) {
-            imageContent = downloaded;
+            mediaContent = { type: "image", image: downloaded };
             console.log(`[image] Downloaded ${(downloaded.data.length / 1024).toFixed(1)}KB`);
           } else {
-            // Failed to download, respond with error
             await sock.sendMessage(chatId, { text: "🦞 Sorry, I couldn't process that image." });
             continue;
           }
         }
 
-        // Check for commands (skip images for commands)
-        if (isCommand(text) && !hasImage) {
+        // Download document if present
+        if (hasDocument) {
+          console.log(`[doc] Downloading "${docMessage?.fileName}" from ${senderId}`);
+          const result = await downloadDocument(msg);
+          if (typeof result === "string") {
+            await sock.sendMessage(chatId, { text: `🦞 ${result}` });
+            continue;
+          }
+          mediaContent = { type: "document", document: result.content, fileName: result.fileName };
+          console.log(`[doc] Processed ${result.fileName} (${result.content.kind})`);
+
+          // Token budget pre-check for large documents
+          const estimatedTokens = estimateDocumentTokens(result.content);
+          const projectedUsage = (lizardBrain.tokens.used + estimatedTokens) / lizardBrain.tokens.budget;
+          if (projectedUsage > 0.9) {
+            await sock.sendMessage(chatId, {
+              text: "🦞 That document looks large and would use up most of my remaining thinking budget for today. Could you ask me about specific parts instead, or send a smaller excerpt?",
+            });
+            continue;
+          }
+        }
+
+        // Check for commands (skip media messages for commands)
+        if (isCommand(text) && !mediaContent) {
           const cmdResponse = handleCommand(chatId, senderId, text);
           if (cmdResponse) {
             response = cmdResponse;
             skippedApi = true;
           } else {
-            // Not a recognized command, treat as regular message
             status.activity = "thinking";
             status.activityUntil = Date.now() + 30000;
             response = await chat(chatId, text);
           }
-        } else if (!hasImage) {
-          // Check lizard-brain quick patterns first (text only, no images)
+        } else if (!mediaContent) {
+          // Check lizard-brain quick patterns first (text only, no media)
           const quickResponse = tryQuickResponse(chatId, text);
           if (quickResponse) {
             response = quickResponse;
             skippedApi = true;
             console.log(`[lizard] Quick response (skipped API)`);
           } else {
-            // Regular message - chat with Claude
             status.activity = "thinking";
             status.activityUntil = Date.now() + 30000;
             response = await chat(chatId, text);
           }
         } else {
-          // Image message - always use Claude API for vision
+          // Media message - always use Claude API
           status.activity = "thinking";
           status.activityUntil = Date.now() + 30000;
-          response = await chat(chatId, text, imageContent);
+          response = await chat(chatId, text, mediaContent);
         }
 
         // Store response for "what did you say" pattern (even for quick responses)
