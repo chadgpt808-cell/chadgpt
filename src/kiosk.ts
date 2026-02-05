@@ -72,6 +72,34 @@ export function formatUptime(): string {
 // Status Server (for kiosk display)
 // ============================================================================
 
+function getStatusPayload() {
+  return {
+    state: _status.state,
+    qrCode: _status.qrCode,
+    uptime: formatUptime(),
+    phoneNumber: _status.phoneNumber,
+    messagesReceived: _status.messagesReceived,
+    messagesSent: _status.messagesSent,
+    lastMessage: _status.lastMessage,
+    activity: _status.activity,
+    activityUntil: _status.activityUntil,
+    avatarState: getAvatarState(),
+    lizardBrain: {
+      energy: _brain.energy,
+      stress: _brain.stress,
+      curiosity: Math.round(_brain.curiosity),
+      tokens: {
+        used: _brain.tokens.used,
+        budget: _brain.tokens.budget,
+        usagePercent: Math.round((_brain.tokens.used / _brain.tokens.budget) * 100),
+        resetAt: _brain.tokens.resetAt,
+      },
+      pendingReminders: _brain.proactive.pendingReminders.length,
+      apiErrors: _brain.resources.apiErrors,
+    },
+  };
+}
+
 export function startStatusServer() {
   if (_serverStarted) return; // Only start once
   _serverStarted = true;
@@ -79,23 +107,33 @@ export function startStatusServer() {
   const server = http.createServer((req, res) => {
     if (req.url === "/api/status") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        ..._status,
-        uptime: formatUptime(),
-        lizardBrain: {
-          energy: _brain.energy,
-          stress: _brain.stress,
-          curiosity: Math.round(_brain.curiosity),
-          tokens: {
-            used: _brain.tokens.used,
-            budget: _brain.tokens.budget,
-            usagePercent: Math.round((_brain.tokens.used / _brain.tokens.budget) * 100),
-            resetAt: _brain.tokens.resetAt,
-          },
-          pendingReminders: _brain.proactive.pendingReminders.length,
-          apiErrors: _brain.resources.apiErrors,
-        },
-      }));
+      res.end(JSON.stringify(getStatusPayload()));
+      return;
+    }
+
+    // SSE endpoint for real-time updates
+    if (req.url === "/events") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      });
+
+      // Send initial state immediately
+      res.write(`data: ${JSON.stringify(getStatusPayload())}\n\n`);
+
+      // Push updates every 2 seconds
+      const interval = setInterval(() => {
+        try {
+          res.write(`data: ${JSON.stringify(getStatusPayload())}\n\n`);
+        } catch {
+          clearInterval(interval);
+        }
+      }, 2000);
+
+      req.on("close", () => {
+        clearInterval(interval);
+      });
       return;
     }
 
@@ -147,6 +185,8 @@ function generateKioskHTML(): string {
   <div class="nav-hint right" id="navHintRight">
     <svg viewBox="0 0 24 24" width="24" height="24"><path fill="currentColor" d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/></svg>
   </div>
+
+  <button id="mute-button" class="mute-button" aria-label="Mute sounds"></button>
 
   <script>
     ${generateKioskJS()}
@@ -346,19 +386,17 @@ function generateLobsterSVG(): string {
 
 function generateAvatarPage(): string {
   const avatarState = getAvatarState();
-  const qrSection = _status.qrCode && _status.state === "qr"
-    ? `<div class="qr-overlay">
-        <div class="qr-label">Scan with WhatsApp:</div>
-        <pre class="qr-code">${escapeHtml(_status.qrCode)}</pre>
-       </div>`
-    : "";
+  const showQr = _status.qrCode && _status.state === "qr";
 
   return `<div class="page avatar-page" data-page="0">
-    <div class="avatar-container" data-state="${avatarState}">
+    <div class="avatar-container" id="avatar-container" data-state="${avatarState}">
       ${generateLobsterSVG()}
-      <div class="avatar-status-label">${getAvatarStatusLabel(avatarState)}</div>
+      <div class="avatar-status-label" id="avatar-status-label">${getAvatarStatusLabel(avatarState)}</div>
     </div>
-    ${qrSection}
+    <div class="qr-overlay" id="qr-overlay" style="display:${showQr ? "block" : "none"}">
+      <div class="qr-label">Scan with WhatsApp:</div>
+      <pre class="qr-code" id="qr-code">${showQr ? escapeHtml(_status.qrCode!) : ""}</pre>
+    </div>
     <div class="swipe-hint">Swipe for stats <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/></svg></div>
   </div>`;
 }
@@ -412,13 +450,8 @@ function generateStatusPage(): string {
     ? '<svg class="icon icon-mood"><use href="#icon-mood-curious"/></svg>'
     : '<svg class="icon icon-mood"><use href="#icon-mood-happy"/></svg>';
 
-  const lastMessageSection = _status.lastMessage
-    ? `<div class="last-message">
-        <div class="label">Last message:</div>
-        <div class="message">"${escapeHtml(_status.lastMessage.preview)}"</div>
-        <div class="time">${new Date(_status.lastMessage.time).toLocaleTimeString()}</div>
-       </div>`
-    : "";
+  const hasLastMessage = !!_status.lastMessage;
+  const hasReminders = _brain.proactive.pendingReminders.length > 0;
 
   return `<div class="page status-page" data-page="1">
     <div class="page-header">
@@ -426,23 +459,21 @@ function generateStatusPage(): string {
       <span class="title">ChadGPT</span>
     </div>
 
-    <div class="status-card">
+    <div class="status-card" id="status-card">
       <div class="status-row">
         <span class="status-label">Status</span>
-        <span class="status-value ${stateClass}">
+        <span class="status-value ${stateClass}" id="status-state">
           ${stateIcon} ${stateText}
         </span>
       </div>
       <div class="status-row">
         <span class="status-label"><svg class="icon-sm"><use href="#icon-clock"/></svg> Uptime</span>
-        <span class="status-value">${formatUptime()}</span>
+        <span class="status-value" id="uptime-value">${formatUptime()}</span>
       </div>
-      ${_status.phoneNumber ? `
-      <div class="status-row">
+      <div class="status-row" id="phone-row" style="display:${_status.phoneNumber ? "flex" : "none"}">
         <span class="status-label"><svg class="icon-sm"><use href="#icon-phone"/></svg> Phone</span>
-        <span class="status-value">${escapeHtml(_status.phoneNumber!)}</span>
+        <span class="status-value" id="phone-value">${_status.phoneNumber ? escapeHtml(_status.phoneNumber) : ""}</span>
       </div>
-      ` : ''}
       <div class="status-row">
         <span class="status-label">Model</span>
         <span class="status-value model-name">${escapeHtml(_config.model.split('/').pop() || _config.model)}</span>
@@ -451,11 +482,11 @@ function generateStatusPage(): string {
 
     <div class="stats">
       <div class="stat">
-        <div class="stat-value">${_status.messagesReceived}</div>
+        <div class="stat-value" id="messages-received">${_status.messagesReceived}</div>
         <div class="stat-label">Received</div>
       </div>
       <div class="stat">
-        <div class="stat-value">${_status.messagesSent}</div>
+        <div class="stat-value" id="messages-sent">${_status.messagesSent}</div>
         <div class="stat-label">Sent</div>
       </div>
     </div>
@@ -464,56 +495,58 @@ function generateStatusPage(): string {
       <div class="lizard-header">
         <svg class="icon"><use href="#icon-brain"/></svg>
         <span>Lizard-Brain</span>
-        ${moodIcon}
+        <span id="mood-icon">${moodIcon}</span>
       </div>
 
       <div class="mood-bar">
         <span class="mood-label"><svg class="icon-sm"><use href="#icon-power"/></svg> Energy</span>
         <div class="mood-track">
-          <div class="mood-fill energy" style="width: ${_brain.energy}%"></div>
+          <div class="mood-fill energy" id="energy-fill" style="width: ${_brain.energy}%"></div>
         </div>
-        <span class="mood-value">${_brain.energy}%</span>
+        <span class="mood-value" id="energy-value">${_brain.energy}%</span>
       </div>
 
       <div class="mood-bar">
         <span class="mood-label">Stress</span>
         <div class="mood-track">
-          <div class="mood-fill stress" style="width: ${_brain.stress}%"></div>
+          <div class="mood-fill stress" id="stress-fill" style="width: ${_brain.stress}%"></div>
         </div>
-        <span class="mood-value">${_brain.stress}%</span>
+        <span class="mood-value" id="stress-value">${_brain.stress}%</span>
       </div>
 
       <div class="mood-bar">
         <span class="mood-label">Curiosity</span>
         <div class="mood-track">
-          <div class="mood-fill curiosity" style="width: ${Math.round(_brain.curiosity)}%"></div>
+          <div class="mood-fill curiosity" id="curiosity-fill" style="width: ${Math.round(_brain.curiosity)}%"></div>
         </div>
-        <span class="mood-value">${Math.round(_brain.curiosity)}%</span>
+        <span class="mood-value" id="curiosity-value">${Math.round(_brain.curiosity)}%</span>
       </div>
 
       <div class="token-section">
         <div class="token-header">
           <span class="token-label"><svg class="icon-sm"><use href="#icon-battery"/></svg> Token Budget</span>
-          <span class="token-value">${tokenUsage}%</span>
+          <span class="token-value" id="token-percent">${tokenUsage}%</span>
         </div>
         <div class="token-bar">
-          <div class="token-fill ${tokenClass}" style="width: ${Math.min(100, tokenUsage)}%"></div>
+          <div class="token-fill ${tokenClass}" id="token-fill" style="width: ${Math.min(100, tokenUsage)}%"></div>
         </div>
         <div class="token-details">
-          <span>${_brain.tokens.used.toLocaleString()} used</span>
-          <span>${_brain.tokens.budget.toLocaleString()} budget</span>
+          <span id="token-used">${_brain.tokens.used.toLocaleString()} used</span>
+          <span id="token-budget">${_brain.tokens.budget.toLocaleString()} budget</span>
         </div>
       </div>
 
-      ${_brain.proactive.pendingReminders.length > 0 ? `
-      <div class="reminders-section">
+      <div class="reminders-section" id="reminders-section" style="display:${hasReminders ? "flex" : "none"}">
         <svg class="icon-sm"><use href="#icon-clock"/></svg>
-        <span>${_brain.proactive.pendingReminders.length} pending reminder${_brain.proactive.pendingReminders.length !== 1 ? 's' : ''}</span>
+        <span id="reminders-count">${_brain.proactive.pendingReminders.length} pending reminder${_brain.proactive.pendingReminders.length !== 1 ? 's' : ''}</span>
       </div>
-      ` : ''}
     </div>
 
-    ${lastMessageSection}
+    <div class="last-message" id="last-message-section" style="display:${hasLastMessage ? "block" : "none"}">
+      <div class="label">Last message:</div>
+      <div class="message" id="last-message-text">${hasLastMessage ? `"${escapeHtml(_status.lastMessage!.preview)}"` : ""}</div>
+      <div class="time" id="last-message-time">${hasLastMessage ? new Date(_status.lastMessage!.time).toLocaleTimeString() : ""}</div>
+    </div>
   </div>`;
 }
 
@@ -1281,6 +1314,109 @@ function generateKioskCSS(): string {
       font-size: 12px;
     }
 
+    /* ---- Mute Button ---- */
+    .mute-button {
+      position: fixed;
+      top: 15px;
+      right: 15px;
+      width: 44px;
+      height: 44px;
+      border: none;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.12);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      color: white;
+      font-size: 20px;
+      cursor: pointer;
+      z-index: 200;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    .mute-button:hover { background: rgba(255,255,255,0.22); transform: scale(1.1); }
+    .mute-button:active { transform: scale(0.95); }
+
+    /* ---- Smooth Bar Transitions ---- */
+    .mood-fill, .token-fill {
+      transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1), background 0.3s ease;
+    }
+
+    /* ---- Counter Pulse ---- */
+    @keyframes counter-pulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.15); color: #60a5fa; }
+    }
+    .stat-value.pulse {
+      animation: counter-pulse 0.5s ease;
+    }
+
+    /* ---- Connection Status Dots ---- */
+    .status-value.status-connected::before {
+      content: '';
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #4ade80;
+      margin-right: 6px;
+      animation: status-dot-pulse 2s ease-in-out infinite;
+    }
+    @keyframes status-dot-pulse {
+      0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(74,222,128,0.7); }
+      50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(74,222,128,0); }
+    }
+    .status-value.status-disconnected::before {
+      content: '';
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #f87171;
+      margin-right: 6px;
+    }
+    .status-value.status-qr::before {
+      content: '';
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #fbbf24;
+      margin-right: 6px;
+      animation: status-blink 1s ease-in-out infinite;
+    }
+    @keyframes status-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    /* ---- Activity Pulse ---- */
+    @keyframes activity-glow {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(96,165,250,0); }
+      50% { box-shadow: 0 0 20px 4px rgba(96,165,250,0.3); }
+    }
+    .status-card.activity-pulse {
+      animation: activity-glow 0.6s ease;
+    }
+
+    /* ---- Avatar Crossfade ---- */
+    .avatar-container {
+      transition: opacity 0.3s ease;
+    }
+    .lobster-svg * {
+      transition: fill 0.3s ease, stroke 0.3s ease, filter 0.5s ease;
+    }
+
+    /* ---- Enhanced Bubbles ---- */
+    .bubble {
+      filter: blur(0.5px);
+    }
+    .b1 { animation-delay: 0s; animation-duration: 4s; }
+    .b2 { animation-delay: 1.3s; animation-duration: 5s; }
+    .b3 { animation-delay: 2.6s; animation-duration: 3.5s; }
+
     /* Responsive adjustments */
     @media (max-width: 380px) {
       .avatar-container {
@@ -1403,20 +1539,268 @@ function generateKioskJS(): string {
       // Initialize
       updatePage(0);
 
-      // Auto-refresh every 3 seconds
-      setTimeout(function() {
-        // Preserve current page across refresh
-        const url = new URL(window.location);
-        url.searchParams.set('page', currentPage);
-        window.location = url;
-      }, 3000);
+      // ================================================================
+      // Web Audio API Sound System
+      // ================================================================
+      var AudioCtx = window.AudioContext || window.webkitAudioContext;
+      var audioCtx = null;
+      var isMuted = localStorage.getItem('kioskMuted') === 'true';
 
-      // Restore page from URL
-      const urlParams = new URLSearchParams(window.location.search);
-      const savedPage = parseInt(urlParams.get('page')) || 0;
-      if (savedPage !== 0) {
-        updatePage(savedPage);
+      function initAudio() {
+        if (!audioCtx && AudioCtx) audioCtx = new AudioCtx();
       }
+
+      function playTone(freq, startTime, dur, type, vol) {
+        if (!audioCtx) return;
+        var osc = audioCtx.createOscillator();
+        var gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.frequency.value = freq;
+        osc.type = type || 'sine';
+        gain.gain.setValueAtTime(0, startTime);
+        gain.gain.linearRampToValueAtTime(0.12 * (vol || 1), startTime + 0.01);
+        gain.gain.exponentialRampToValueAtTime(0.001, startTime + dur);
+        osc.start(startTime);
+        osc.stop(startTime + dur);
+      }
+
+      function playSound(type) {
+        if (isMuted || !AudioCtx) return;
+        initAudio();
+        if (!audioCtx) return;
+        var t = audioCtx.currentTime;
+        switch (type) {
+          case 'receive':
+            playTone(800, t, 0.08, 'sine', 1);
+            playTone(1000, t + 0.08, 0.1, 'sine', 1);
+            break;
+          case 'send':
+            playTone(200, t, 0.06, 'triangle', 0.4);
+            break;
+          case 'error':
+            playTone(150, t, 0.2, 'square', 0.5);
+            break;
+          case 'connect':
+            playTone(523, t, 0.15, 'sine', 0.8);
+            playTone(659, t, 0.15, 'sine', 0.6);
+            playTone(784, t, 0.15, 'sine', 0.5);
+            break;
+          case 'qr':
+            playTone(660, t, 0.1, 'sine', 0.7);
+            playTone(880, t + 0.1, 0.12, 'sine', 0.7);
+            break;
+        }
+      }
+
+      function toggleMute() {
+        isMuted = !isMuted;
+        localStorage.setItem('kioskMuted', String(isMuted));
+        updateMuteButton();
+        if (!isMuted) playSound('send');
+      }
+
+      function updateMuteButton() {
+        var btn = document.getElementById('mute-button');
+        if (btn) {
+          btn.textContent = isMuted ? '\\u{1F507}' : '\\u{1F50A}';
+        }
+      }
+
+      var muteBtn = document.getElementById('mute-button');
+      if (muteBtn) {
+        muteBtn.addEventListener('click', toggleMute);
+        // Init audio on first user interaction (browser requirement)
+        muteBtn.addEventListener('click', function() { initAudio(); }, { once: true });
+      }
+      updateMuteButton();
+
+      // ================================================================
+      // SSE Real-Time Updates
+      // ================================================================
+      var prevState = {};
+      var reconnectAttempts = 0;
+
+      function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+      function animateCounter(id, oldVal, newVal) {
+        var el = document.getElementById(id);
+        if (!el || oldVal === newVal || oldVal === undefined) {
+          if (el) el.textContent = newVal;
+          return;
+        }
+        var start = oldVal || 0;
+        var end = newVal;
+        var duration = 500;
+        var startTime = performance.now();
+        // Pulse animation
+        el.classList.remove('pulse');
+        void el.offsetWidth; // force reflow
+        el.classList.add('pulse');
+        function tick(now) {
+          var progress = Math.min((now - startTime) / duration, 1);
+          el.textContent = Math.round(start + (end - start) * easeOutCubic(progress));
+          if (progress < 1) requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+      }
+
+      function animateBar(fillId, valueId, percent, cls) {
+        var fill = document.getElementById(fillId);
+        var val = document.getElementById(valueId);
+        if (fill) {
+          fill.style.width = Math.min(100, percent) + '%';
+          if (cls) fill.className = fill.className.replace(/\\b(healthy|moderate|low|critical)\\b/g, '') + ' ' + cls;
+        }
+        if (val) val.textContent = percent + '%';
+      }
+
+      function setText(id, text) {
+        var el = document.getElementById(id);
+        if (el && el.textContent !== String(text)) el.textContent = text;
+      }
+
+      function setDisplay(id, show) {
+        var el = document.getElementById(id);
+        if (el) el.style.display = show ? '' : 'none';
+      }
+
+      var avatarLabels = {
+        happy: 'Feeling good!',
+        tired: 'A bit sleepy...',
+        stressed: 'Taking deep breaths',
+        curious: "What's new?",
+        error: 'Something went wrong',
+        'budget-warning': 'Running low on energy',
+        exhausted: 'Need to rest...',
+        disconnected: 'Lost connection',
+        qr: 'Ready to connect!',
+        receiving: 'Message received!',
+        thinking: 'Thinking...',
+        sending: 'Responding!'
+      };
+
+      var stateConfig = {
+        starting: { icon: 'loading', text: 'Starting...', cls: 'status-qr', spin: true },
+        qr: { icon: 'phone', text: 'Scan QR Code', cls: 'status-qr', spin: false },
+        connected: { icon: 'check', text: 'Connected', cls: 'status-connected', spin: false },
+        disconnected: { icon: 'error', text: 'Disconnected', cls: 'status-disconnected', spin: false }
+      };
+
+      function esc(s) {
+        var d = document.createElement('div');
+        d.textContent = s;
+        return d.innerHTML;
+      }
+
+      function updateUI(data) {
+        // Avatar state
+        var ac = document.getElementById('avatar-container');
+        if (ac && data.avatarState !== prevState.avatarState) {
+          ac.dataset.state = data.avatarState;
+          setText('avatar-status-label', avatarLabels[data.avatarState] || 'Hello!');
+        }
+
+        // QR overlay
+        var showQr = data.state === 'qr' && data.qrCode;
+        setDisplay('qr-overlay', showQr);
+        if (showQr) {
+          var qrEl = document.getElementById('qr-code');
+          if (qrEl) qrEl.textContent = data.qrCode;
+        }
+
+        // Connection status
+        if (data.state !== prevState.state) {
+          var cfg = stateConfig[data.state];
+          var stEl = document.getElementById('status-state');
+          if (stEl && cfg) {
+            stEl.className = 'status-value ' + cfg.cls;
+            stEl.innerHTML = '<svg class="icon' + (cfg.spin ? ' icon-loading spin' : '') + '"><use href="#icon-' + cfg.icon + '"/></svg> ' + esc(cfg.text);
+          }
+          // Sound on state change
+          if (data.state === 'connected' && prevState.state) playSound('connect');
+          else if (data.state === 'qr') playSound('qr');
+          else if (data.state === 'disconnected' && prevState.state) playSound('error');
+        }
+
+        // Uptime
+        setText('uptime-value', data.uptime);
+
+        // Phone
+        setDisplay('phone-row', !!data.phoneNumber);
+        if (data.phoneNumber) setText('phone-value', data.phoneNumber);
+
+        // Message counters with animation + sound
+        if (data.messagesReceived > (prevState.messagesReceived || 0)) playSound('receive');
+        if (data.messagesSent > (prevState.messagesSent || 0)) playSound('send');
+        animateCounter('messages-received', prevState.messagesReceived, data.messagesReceived);
+        animateCounter('messages-sent', prevState.messagesSent, data.messagesSent);
+
+        // Activity pulse on status card
+        var card = document.getElementById('status-card');
+        if (card && data.activity && data.activity !== prevState.activity) {
+          card.classList.remove('activity-pulse');
+          void card.offsetWidth;
+          card.classList.add('activity-pulse');
+        }
+
+        // Mood icon
+        var mi = document.getElementById('mood-icon');
+        if (mi) {
+          var iconType = data.lizardBrain.energy < 30 ? 'mood-tired'
+            : data.lizardBrain.stress > 50 ? 'mood-stressed'
+            : data.lizardBrain.curiosity > 80 ? 'mood-curious'
+            : 'mood-happy';
+          mi.innerHTML = '<svg class="icon icon-mood"><use href="#icon-' + iconType + '"/></svg>';
+        }
+
+        // Mood bars
+        animateBar('energy-fill', 'energy-value', data.lizardBrain.energy);
+        animateBar('stress-fill', 'stress-value', data.lizardBrain.stress);
+        animateBar('curiosity-fill', 'curiosity-value', data.lizardBrain.curiosity);
+
+        // Token usage
+        var tp = data.lizardBrain.tokens.usagePercent;
+        var tc = tp >= 90 ? 'critical' : tp >= 75 ? 'low' : tp >= 50 ? 'moderate' : 'healthy';
+        animateBar('token-fill', 'token-percent', tp, tc);
+        setText('token-used', data.lizardBrain.tokens.used.toLocaleString() + ' used');
+        setText('token-budget', data.lizardBrain.tokens.budget.toLocaleString() + ' budget');
+
+        // Reminders
+        var rc = data.lizardBrain.pendingReminders;
+        setDisplay('reminders-section', rc > 0);
+        if (rc > 0) setText('reminders-count', rc + ' pending reminder' + (rc !== 1 ? 's' : ''));
+
+        // Last message
+        var hasMsg = !!data.lastMessage;
+        setDisplay('last-message-section', hasMsg);
+        if (hasMsg) {
+          setText('last-message-text', '"' + data.lastMessage.preview + '"');
+          setText('last-message-time', new Date(data.lastMessage.time).toLocaleTimeString());
+        }
+
+        prevState = data;
+      }
+
+      // SSE connection with auto-reconnect
+      var eventSource = null;
+      function connectSSE() {
+        if (eventSource) { try { eventSource.close(); } catch(e) {} }
+        eventSource = new EventSource('/events');
+        eventSource.onopen = function() {
+          reconnectAttempts = 0;
+        };
+        eventSource.onmessage = function(e) {
+          try { updateUI(JSON.parse(e.data)); } catch(err) { console.error('SSE parse error:', err); }
+        };
+        eventSource.onerror = function() {
+          try { eventSource.close(); } catch(e) {}
+          var delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
+          reconnectAttempts++;
+          setTimeout(connectSSE, delay);
+        };
+      }
+      connectSSE();
     })();
   `;
 }
