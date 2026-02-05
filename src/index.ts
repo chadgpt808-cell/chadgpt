@@ -1278,7 +1278,7 @@ Running on minimal hardware 💪`;
             await sendMessageFn?.(chatId, `❌ Google Drive setup failed: ${err}`);
           }
         })();
-        return null; // Response sent async
+        return "⏳ Starting Google Drive setup..."; // Async flow will send follow-up messages
       }
 
       if (subCmd === "status") {

@@ -120,8 +120,7 @@ async function getAccessToken(): Promise<string> {
 // ============================================================================
 
 const SCOPES = [
-  "https://www.googleapis.com/auth/drive",
-  "https://www.googleapis.com/auth/documents",
+  "https://www.googleapis.com/auth/drive.file",
 ];
 
 export async function startDeviceCodeFlow(): Promise<{
