@@ -335,8 +335,8 @@ src/
 
 | Item | Size |
 |------|------|
-| node_modules | ~100MB |
-| Application code | ~120KB |
+| node_modules | ~127MB |
+| Application code | ~168KB |
 | WhatsApp auth state | ~50KB |
 | Session files (per chat) | ~2-10KB each |
 
@@ -355,7 +355,7 @@ The lizard-brain handles greetings, thanks, time/date queries, and reminders wit
 | Resource | Available | Used | Headroom |
 |----------|-----------|------|----------|
 | RAM | 1GB | ~150MB | ~850MB for Android |
-| Storage | 8-16GB | ~100MB | Plenty |
+| Storage | 8-16GB | ~128MB | Plenty |
 
 ## Security
 
@@ -432,7 +432,7 @@ ps aux | grep node
 | Reminders | No | Yes |
 | Sound effects | No | Yes |
 | RAM usage | 500-800MB | ~150MB |
-| Install size | 1.5GB+ | ~100MB |
+| Install size | 1.5GB+ | ~128MB |
 
 ## License
 
