@@ -134,9 +134,10 @@ Send these to the bot in WhatsApp:
 ### General
 | Command | Description |
 |---------|-------------|
-| `/help` | Show available commands |
+| `/help` or `/commands` | Show available commands |
 | `/clear` or `/reset` | Clear conversation history |
 | `/status` | Show bot status (mood, tokens, uptime, reminders) |
+| `/feed` | Reset token budget and restore energy |
 | `/remember` | Show stored memories about you |
 | `/forget` | Clear all stored memories |
 
