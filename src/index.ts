@@ -19,6 +19,7 @@ import qrcode from "qrcode-terminal";
 import * as fs from "fs";
 import * as path from "path";
 import * as http from "http";
+import * as crypto from "crypto";
 import mammoth from "mammoth";
 import "dotenv/config";
 
@@ -71,6 +72,11 @@ const CONFIG = {
   // Tavily API key for web search (optional)
   tavilyApiKey: process.env.TAVILY_API_KEY || "",
 };
+
+// Set system timezone if configured (must be before any Date usage)
+if (process.env.OPENCLAW_TIMEZONE) {
+  process.env.TZ = process.env.OPENCLAW_TIMEZONE;
+}
 
 // ============================================================================
 // Lizard-Brain Types and State
@@ -132,6 +138,23 @@ const lizardBrain: LizardBrain = {
   },
   lastResponses: new Map(),
 };
+
+// Pending contact tag state: chatId -> { eventId, expiresAt }
+const pendingContactTag = new Map<string, { eventId: string; expiresAt: number }>();
+
+function setPendingContactTag(chatId: string, eventId: string): void {
+  pendingContactTag.set(chatId, { eventId, expiresAt: Date.now() + 120_000 });
+}
+
+function consumePendingContactTag(chatId: string): string | null {
+  const pending = pendingContactTag.get(chatId);
+  if (!pending || Date.now() > pending.expiresAt) {
+    pendingContactTag.delete(chatId);
+    return null;
+  }
+  pendingContactTag.delete(chatId);
+  return pending.eventId;
+}
 
 function getNextMidnight(): number {
   const now = new Date();
@@ -509,6 +532,18 @@ async function runLizardLoop(): Promise<void> {
 
     // Remove processed reminders
     lizardBrain.proactive.pendingReminders = lizardBrain.proactive.pendingReminders.filter(r => r.dueAt > now);
+  }
+
+  // 3.5. Calendar digests
+  if (sendMessageFn) {
+    await processCalendarDigests();
+  }
+
+  // 3.6. Clean up expired pending contact tags
+  for (const [chatId, state] of pendingContactTag.entries()) {
+    if (Date.now() > state.expiresAt) {
+      pendingContactTag.delete(chatId);
+    }
   }
 
   // 4. Cleanup - Evict old tracking data (lastResponses older than 1 hour)
@@ -2120,7 +2155,7 @@ function buildSystemPrompt(): string {
 
   const personalitySection = soul || DEFAULT_PERSONALITY;
 
-  return `You are OpenClaw, a personal AI assistant. You communicate via WhatsApp.
+  return `You are ChadGPT, a personal AI assistant. You communicate via WhatsApp.
 
 ${personalitySection}
 
@@ -2129,12 +2164,31 @@ ${personalitySection}
 - Help with tasks, planning, and problem-solving
 - Provide information and explanations
 - Analyze images and documents (PDF, text files, Word .docx)
+- Search the web for current information
+- Set reminders ("remind me in 30 min to call mom")
+- Manage a family calendar with daily/weekly event digests
 - Be a thoughtful companion
+
+## Commands (users type these)
+- /help - Show all commands
+- /calendar - Show all events
+- /event add daily HH:MM Title - Add daily recurring event
+- /event add weekly Mon HH:MM Title - Add weekly event
+- /event add once YYYY-MM-DD HH:MM Title - Add one-time event
+- /event remove <id> - Remove an event
+- /event tag <id> - Tag a contact to an event (then share a contact)
+- /event digest daily HH:MM - Set daily digest time
+- /event digest weekly Day HH:MM - Set weekly digest time
+- /status - Show bot status
+- /remember - Show stored memories
+- /forget - Clear memories
+- /clear - Clear conversation history
 
 ## Guidelines
 - Keep responses concise for mobile reading
 - Use markdown sparingly (WhatsApp has limited formatting)
-- If asked about yourself, you're "OpenClaw Lite" - a minimal personal AI assistant
+- If asked about yourself, you're "ChadGPT" - a personal AI assistant
+- If asked what you can do, mention your key capabilities and suggest /help for commands
 - Be warm but not overly effusive
 - If you don't know something, say so
 
@@ -2187,6 +2241,260 @@ function loadMemory(chatId: string): UserMemory {
 function saveMemory(chatId: string, memory: UserMemory): void {
   fs.mkdirSync(path.join(CONFIG.workspaceDir, "memory"), { recursive: true });
   fs.writeFileSync(getMemoryPath(chatId), JSON.stringify(memory));
+}
+
+// ============================================================================
+// Calendar / Events System
+// ============================================================================
+
+type CalendarEvent = {
+  id: string;
+  title: string;
+  recurrence: "daily" | "weekly" | "once";
+  dayOfWeek?: number;       // 0=Sun..6=Sat (weekly only)
+  time: string;             // "HH:MM" 24h
+  date?: string;            // "YYYY-MM-DD" (once only)
+  taggedUsers: Array<{ jid: string; name: string }>;
+  createdBy: string;
+  createdAt: number;
+  chatId: string;
+};
+
+type CalendarData = {
+  events: CalendarEvent[];
+  digestConfig: { dailyTime: string; weeklyDay: number; weeklyTime: string };
+  lastDailyDigest: Record<string, number>;
+  lastWeeklyDigest: Record<string, number>;
+};
+
+const DAY_NAMES_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const DAY_NAMES_FULL = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DAY_MAP: Record<string, number> = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+};
+
+function getCalendarPath(): string {
+  return path.join(CONFIG.workspaceDir, "calendar.json");
+}
+
+function loadCalendar(): CalendarData {
+  try {
+    const data = fs.readFileSync(getCalendarPath(), "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return {
+      events: [],
+      digestConfig: { dailyTime: "07:00", weeklyDay: 0, weeklyTime: "18:00" },
+      lastDailyDigest: {},
+      lastWeeklyDigest: {},
+    };
+  }
+}
+
+function saveCalendar(cal: CalendarData): void {
+  fs.writeFileSync(getCalendarPath(), JSON.stringify(cal));
+}
+
+function generateEventId(): string {
+  return crypto.randomBytes(4).toString("hex");
+}
+
+function parseVCard(vcard: string): { phoneNumber: string; name: string } | null {
+  const fnMatch = vcard.match(/FN:(.+)/i);
+  const name = fnMatch?.[1]?.trim() || "Unknown";
+
+  // Prefer waid (WhatsApp ID) if present
+  const waidMatch = vcard.match(/waid=(\d+)/i);
+  if (waidMatch) {
+    return { phoneNumber: waidMatch[1], name };
+  }
+
+  // Fall back to TEL field
+  const telMatch = vcard.match(/TEL[^:]*:([+\d\s()-]+)/i);
+  if (!telMatch) return null;
+
+  const rawNumber = telMatch[1].replace(/[^0-9]/g, "");
+  if (!rawNumber || rawNumber.length < 7) return null;
+
+  return { phoneNumber: rawNumber, name };
+}
+
+function vcardToJid(phoneNumber: string): string {
+  return `${phoneNumber}@s.whatsapp.net`;
+}
+
+function getTimeStr(date: Date): string {
+  return date.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function getDateStr(date: Date): string {
+  return date.toISOString().split("T")[0];
+}
+
+function isTimeWithinWindow(current: string, target: string, windowSeconds: number): boolean {
+  const [ch, cm] = current.split(":").map(Number);
+  const [th, tm] = target.split(":").map(Number);
+  const currentSecs = ch * 3600 + cm * 60;
+  const targetSecs = th * 3600 + tm * 60;
+  const diff = Math.abs(currentSecs - targetSecs);
+  return diff <= windowSeconds || (86400 - diff) <= windowSeconds;
+}
+
+function collectTodayEvents(events: CalendarEvent[], currentDay: number, todayStr: string): Record<string, CalendarEvent[]> {
+  const result: Record<string, CalendarEvent[]> = {};
+
+  for (const evt of events) {
+    let isToday = false;
+    if (evt.recurrence === "daily") isToday = true;
+    else if (evt.recurrence === "weekly" && evt.dayOfWeek === currentDay) isToday = true;
+    else if (evt.recurrence === "once" && evt.date === todayStr) isToday = true;
+
+    if (isToday) {
+      for (const user of evt.taggedUsers) {
+        if (!result[user.jid]) result[user.jid] = [];
+        result[user.jid].push(evt);
+      }
+    }
+  }
+
+  for (const jid of Object.keys(result)) {
+    result[jid].sort((a, b) => a.time.localeCompare(b.time));
+  }
+  return result;
+}
+
+function collectWeekEvents(events: CalendarEvent[], startDay: number, startDateStr: string): Record<string, Record<number, CalendarEvent[]>> {
+  const result: Record<string, Record<number, CalendarEvent[]>> = {};
+  const startDate = new Date(startDateStr + "T00:00:00");
+
+  for (let d = 0; d < 7; d++) {
+    const day = (startDay + d) % 7;
+    const dateForDay = new Date(startDate.getTime() + d * 86400000);
+    const dateStr = getDateStr(dateForDay);
+
+    for (const evt of events) {
+      let matches = false;
+      if (evt.recurrence === "daily") matches = true;
+      else if (evt.recurrence === "weekly" && evt.dayOfWeek === day) matches = true;
+      else if (evt.recurrence === "once" && evt.date === dateStr) matches = true;
+
+      if (matches) {
+        for (const user of evt.taggedUsers) {
+          if (!result[user.jid]) result[user.jid] = {};
+          if (!result[user.jid][day]) result[user.jid][day] = [];
+          result[user.jid][day].push(evt);
+        }
+      }
+    }
+  }
+
+  for (const jid of Object.keys(result)) {
+    for (const day of Object.keys(result[jid])) {
+      result[jid][Number(day)].sort((a, b) => a.time.localeCompare(b.time));
+    }
+  }
+  return result;
+}
+
+function findUserName(events: CalendarEvent[], jid: string): string {
+  for (const evt of events) {
+    const user = evt.taggedUsers.find(u => u.jid === jid);
+    if (user) return user.name;
+  }
+  return "there";
+}
+
+function cleanupPastEvents(cal: CalendarData): boolean {
+  const todayStr = getDateStr(new Date());
+  const before = cal.events.length;
+  cal.events = cal.events.filter(evt => {
+    if (evt.recurrence !== "once") return true;
+    return evt.date! >= todayStr;
+  });
+  return cal.events.length !== before;
+}
+
+async function processCalendarDigests(): Promise<void> {
+  if (!sendMessageFn) return;
+
+  const cal = loadCalendar();
+  if (cal.events.length === 0) return;
+
+  const now = new Date();
+  const currentTime = getTimeStr(now);
+  const currentDay = now.getDay();
+  const todayStr = getDateStr(now);
+  const nowMs = now.getTime();
+
+  // --- Daily Digest ---
+  if (isTimeWithinWindow(currentTime, cal.digestConfig.dailyTime, 60)) {
+    const userEvents = collectTodayEvents(cal.events, currentDay, todayStr);
+    let saved = false;
+
+    for (const [jid, events] of Object.entries(userEvents)) {
+      const lastSent = cal.lastDailyDigest[jid] || 0;
+      if (todayStr === getDateStr(new Date(lastSent))) continue;
+
+      const userName = findUserName(cal.events, jid);
+      let msg = `📅 *Good morning, ${userName}!*\n\nHere's your schedule for today:\n\n`;
+      for (const evt of events) {
+        msg += `• *${evt.time}* - ${evt.title}\n`;
+      }
+
+      try {
+        await sendMessageFn(jid, msg);
+        cal.lastDailyDigest[jid] = nowMs;
+        saved = true;
+        console.log(`[calendar] Sent daily digest to ${jid}`);
+      } catch (err) {
+        console.error(`[calendar] Failed daily digest to ${jid}:`, err);
+      }
+    }
+    if (saved) saveCalendar(cal);
+  }
+
+  // --- Weekly Digest ---
+  if (currentDay === cal.digestConfig.weeklyDay && isTimeWithinWindow(currentTime, cal.digestConfig.weeklyTime, 60)) {
+    const userWeekEvents = collectWeekEvents(cal.events, currentDay, todayStr);
+    let saved = false;
+
+    for (const [jid, dayMap] of Object.entries(userWeekEvents)) {
+      const lastSent = cal.lastWeeklyDigest[jid] || 0;
+      if (nowMs - lastSent < 23 * 60 * 60 * 1000) continue;
+
+      const userName = findUserName(cal.events, jid);
+      let msg = `📅 *Weekly Schedule, ${userName}!*\n\nHere's your week ahead:\n\n`;
+
+      for (let d = 0; d < 7; d++) {
+        const day = (currentDay + d) % 7;
+        const dateForDay = new Date(now.getTime() + d * 86400000);
+        const eventsForDay = dayMap[day] || [];
+        if (eventsForDay.length === 0) continue;
+
+        msg += `*${DAY_NAMES_FULL[day]} ${getDateStr(dateForDay)}*\n`;
+        for (const evt of eventsForDay) {
+          msg += `  • ${evt.time} - ${evt.title}\n`;
+        }
+        msg += `\n`;
+      }
+
+      try {
+        await sendMessageFn(jid, msg);
+        cal.lastWeeklyDigest[jid] = nowMs;
+        saved = true;
+        console.log(`[calendar] Sent weekly digest to ${jid}`);
+      } catch (err) {
+        console.error(`[calendar] Failed weekly digest to ${jid}:`, err);
+      }
+    }
+    if (saved) saveCalendar(cal);
+  }
+
+  // Cleanup past one-time events
+  if (cleanupPastEvents(cal)) {
+    saveCalendar(cal);
+    console.log("[calendar] Cleaned up past one-time events");
+  }
 }
 
 async function extractFacts(chatId: string, conversation: string): Promise<string[]> {
@@ -2649,12 +2957,17 @@ function handleCommand(chatId: string, senderId: string, text: string): string |
       return "🦞 Session cleared. Starting fresh!";
 
     case "help":
-      return `🦞 *OpenClaw Lite Commands*
+      return `🦞 *ChadGPT Commands*
 
 /clear - Clear conversation history
 /status - Show bot status
 /remember - Show what I remember about you
 /forget - Clear my memory of you
+/calendar - Show all events
+/event add - Add an event
+/event remove <id> - Remove event
+/event tag <id> - Tag a contact
+/event digest - Set digest times
 /help - Show this help
 
 Just send a message to chat with me!`;
@@ -2665,7 +2978,7 @@ Just send a message to chat with me!`;
       const budgetParams = getBudgetAwareParams();
       const moodEmoji = lizardBrain.energy < 30 ? "😴" : lizardBrain.stress > 50 ? "😰" : lizardBrain.curiosity > 80 ? "🤔" : "😊";
 
-      return `🦞 *OpenClaw Lite Status*
+      return `🦞 *ChadGPT Status*
 
 *Connection*
 Model: ${budgetParams.model}
@@ -2706,6 +3019,142 @@ Running on minimal hardware 💪`;
     case "forget":
       saveMemory(chatId, { facts: [], summary: null, summaryUpTo: 0, lastUpdated: 0 });
       return "🧠 Done! I've forgotten everything about you. Fresh start!";
+
+    case "calendar": {
+      const cal = loadCalendar();
+      if (cal.events.length === 0) {
+        return "📅 No events yet. Use `/event add` to create one!";
+      }
+      let output = "📅 *All Events*\n\n";
+      for (const evt of cal.events) {
+        const tagged = evt.taggedUsers.length > 0
+          ? ` (${evt.taggedUsers.map(u => u.name).join(", ")})`
+          : "";
+        let schedule = "";
+        if (evt.recurrence === "daily") schedule = `Daily at ${evt.time}`;
+        else if (evt.recurrence === "weekly") schedule = `Every ${DAY_NAMES_SHORT[evt.dayOfWeek!]} at ${evt.time}`;
+        else schedule = `${evt.date} at ${evt.time}`;
+        output += `*${evt.title}* [${evt.id}]\n${schedule}${tagged}\n\n`;
+      }
+      const cfg = cal.digestConfig;
+      output += `_Digests: daily ${cfg.dailyTime}, weekly ${DAY_NAMES_SHORT[cfg.weeklyDay]} ${cfg.weeklyTime}_`;
+      return output;
+    }
+
+    case "event": {
+      const subCmd = args[0]?.toLowerCase();
+
+      if (subCmd === "add") {
+        const recurrence = args[1]?.toLowerCase();
+
+        if (recurrence === "daily") {
+          const time = args[2];
+          const title = args.slice(3).join(" ");
+          if (!time || !title || !/^\d{2}:\d{2}$/.test(time)) {
+            return "Usage: `/event add daily HH:MM Event title`";
+          }
+          const id = generateEventId();
+          const cal = loadCalendar();
+          cal.events.push({ id, title, recurrence: "daily", time, taggedUsers: [], createdBy: senderId, createdAt: Date.now(), chatId });
+          saveCalendar(cal);
+          setPendingContactTag(chatId, id);
+          return `✅ Daily event "${title}" at ${time} created! [${id}]\n\nSend me a contact to tag someone, or /skip.`;
+        }
+
+        if (recurrence === "weekly") {
+          const dayStr = args[2]?.toLowerCase();
+          const dayOfWeek = DAY_MAP[dayStr];
+          if (dayOfWeek === undefined) {
+            return "Usage: `/event add weekly Mon HH:MM Event title`\nDays: Sun, Mon, Tue, Wed, Thu, Fri, Sat";
+          }
+          const time = args[3];
+          const title = args.slice(4).join(" ");
+          if (!time || !title || !/^\d{2}:\d{2}$/.test(time)) {
+            return "Usage: `/event add weekly Mon HH:MM Event title`";
+          }
+          const id = generateEventId();
+          const cal = loadCalendar();
+          cal.events.push({ id, title, recurrence: "weekly", dayOfWeek, time, taggedUsers: [], createdBy: senderId, createdAt: Date.now(), chatId });
+          saveCalendar(cal);
+          setPendingContactTag(chatId, id);
+          return `✅ Weekly event "${title}" every ${DAY_NAMES_SHORT[dayOfWeek]} at ${time} created! [${id}]\n\nSend me a contact to tag someone, or /skip.`;
+        }
+
+        if (recurrence === "once") {
+          const date = args[2];
+          const time = args[3];
+          const title = args.slice(4).join(" ");
+          if (!date || !time || !title || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(time)) {
+            return "Usage: `/event add once YYYY-MM-DD HH:MM Event title`";
+          }
+          const id = generateEventId();
+          const cal = loadCalendar();
+          cal.events.push({ id, title, recurrence: "once", date, time, taggedUsers: [], createdBy: senderId, createdAt: Date.now(), chatId });
+          saveCalendar(cal);
+          setPendingContactTag(chatId, id);
+          return `✅ Event "${title}" on ${date} at ${time} created! [${id}]\n\nSend me a contact to tag someone, or /skip.`;
+        }
+
+        return "Usage: `/event add daily|weekly|once ...`\n\nExamples:\n`/event add daily 07:30 Take vitamins`\n`/event add weekly Mon 08:00 School run`\n`/event add once 2026-02-15 10:00 Dentist`";
+      }
+
+      if (subCmd === "remove") {
+        const eventId = args[1];
+        if (!eventId) return "Usage: `/event remove <id>`";
+        const cal = loadCalendar();
+        const idx = cal.events.findIndex(e => e.id === eventId);
+        if (idx === -1) return `Event ${eventId} not found.`;
+        const removed = cal.events.splice(idx, 1)[0];
+        saveCalendar(cal);
+        return `🗑️ Removed "${removed.title}" [${eventId}]`;
+      }
+
+      if (subCmd === "tag") {
+        const eventId = args[1];
+        if (!eventId) return "Usage: `/event tag <id>` then send a contact";
+        const cal = loadCalendar();
+        const evt = cal.events.find(e => e.id === eventId);
+        if (!evt) return `Event ${eventId} not found.`;
+        setPendingContactTag(chatId, eventId);
+        return `Send me a contact to tag to "${evt.title}", or /skip to cancel.`;
+      }
+
+      if (subCmd === "digest") {
+        const digestType = args[1]?.toLowerCase();
+        const cal = loadCalendar();
+
+        if (digestType === "daily") {
+          const time = args[2];
+          if (!time || !/^\d{2}:\d{2}$/.test(time)) return "Usage: `/event digest daily HH:MM`";
+          cal.digestConfig.dailyTime = time;
+          saveCalendar(cal);
+          return `📬 Daily digest will be sent at ${time}.`;
+        }
+
+        if (digestType === "weekly") {
+          const dayStr = args[2]?.toLowerCase();
+          const dayOfWeek = DAY_MAP[dayStr];
+          if (dayOfWeek === undefined) return "Usage: `/event digest weekly Sun HH:MM`";
+          const time = args[3];
+          if (!time || !/^\d{2}:\d{2}$/.test(time)) return "Usage: `/event digest weekly Sun HH:MM`";
+          cal.digestConfig.weeklyDay = dayOfWeek;
+          cal.digestConfig.weeklyTime = time;
+          saveCalendar(cal);
+          return `📬 Weekly digest will be sent on ${DAY_NAMES_FULL[dayOfWeek]}s at ${time}.`;
+        }
+
+        return "Usage:\n`/event digest daily HH:MM`\n`/event digest weekly Sun HH:MM`";
+      }
+
+      return "Usage: `/event add|remove|tag|digest ...`\nType `/help` for examples.";
+    }
+
+    case "skip":
+      if (pendingContactTag.has(chatId)) {
+        pendingContactTag.delete(chatId);
+        return "Skipped contact tagging.";
+      }
+      return null;
 
     default:
       return null; // Not a recognized command, treat as regular message
@@ -2843,19 +3292,102 @@ async function startWhatsApp(): Promise<void> {
         continue;
       }
 
+      // Group chat handling: only respond when mentioned
+      const isGroup = chatId.endsWith("@g.us");
+      if (isGroup) {
+        const botJid = sock.user?.id;
+        // Normalize bot JID: strip the device suffix (e.g. "123:45@s.whatsapp.net" -> "123")
+        const botNumber = botJid?.split(":")[0]?.split("@")[0] || "";
+        const mentionedJids: string[] =
+          msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+        const isMentioned = mentionedJids.some(jid => jid.split("@")[0] === botNumber);
+
+        // Also check if the message text contains the bot name
+        const msgText =
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          msg.message?.imageMessage?.caption ||
+          "";
+        const nameMatch = /openclaw|chadgpt|chad/i.test(msgText);
+
+        if (!isMentioned && !nameMatch) {
+          continue; // Ignore group messages where bot is not mentioned
+        }
+        console.log(`[group] Bot mentioned in ${chatId} by ${senderId}`);
+      }
+
+      // Handle contact messages (for event tagging)
+      const contactMsg = msg.message?.contactMessage;
+      const contactsArrayMsg = msg.message?.contactsArrayMessage;
+
+      if (contactMsg || contactsArrayMsg) {
+        const eventId = consumePendingContactTag(chatId);
+        if (!eventId) continue; // No pending tag, ignore contact
+
+        const contacts: Array<{ vcard: string; displayName: string }> = [];
+        if (contactMsg?.vcard) {
+          contacts.push({ vcard: contactMsg.vcard, displayName: contactMsg.displayName || "Unknown" });
+        }
+        if (contactsArrayMsg?.contacts) {
+          for (const c of contactsArrayMsg.contacts) {
+            if (c.vcard) {
+              contacts.push({ vcard: c.vcard, displayName: c.displayName || "Unknown" });
+            }
+          }
+        }
+
+        const cal = loadCalendar();
+        const evt = cal.events.find(e => e.id === eventId);
+        if (!evt) {
+          await sock.sendMessage(chatId, { text: `Event ${eventId} no longer exists.` });
+          continue;
+        }
+
+        const taggedNames: string[] = [];
+        for (const contact of contacts) {
+          const parsed = parseVCard(contact.vcard);
+          if (!parsed) {
+            await sock.sendMessage(chatId, { text: `Could not parse phone number for ${contact.displayName}. Skipping.` });
+            continue;
+          }
+          const jid = vcardToJid(parsed.phoneNumber);
+          if (!evt.taggedUsers.some(u => u.jid === jid)) {
+            evt.taggedUsers.push({ jid, name: parsed.name });
+            taggedNames.push(parsed.name);
+          }
+        }
+
+        saveCalendar(cal);
+
+        if (taggedNames.length > 0) {
+          await sock.sendMessage(chatId, {
+            text: `👤 Tagged ${taggedNames.join(", ")} to "${evt.title}"!\n\nSend another contact to tag more, or /skip to finish.`,
+          });
+          setPendingContactTag(chatId, eventId);
+        } else {
+          await sock.sendMessage(chatId, { text: "No valid contacts were tagged." });
+        }
+        continue;
+      }
+
       // Extract text, image, and document content
       const imageMessage = msg.message?.imageMessage;
       const docMessage =
         msg.message?.documentMessage ||
         (msg.message as any)?.documentWithCaptionMessage?.message?.documentMessage;
 
-      const text =
+      let text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         imageMessage?.caption ||
         docMessage?.caption ||
         (msg.message as any)?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
         "";
+
+      // In groups, strip @mention tags so Claude sees clean text
+      if (isGroup && text) {
+        text = text.replace(/@\d+/g, "").trim();
+      }
 
       const hasImage = !!imageMessage;
       const hasDocument = !!docMessage;
