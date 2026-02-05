@@ -18,7 +18,6 @@ import Anthropic from "@anthropic-ai/sdk";
 import qrcode from "qrcode-terminal";
 import * as fs from "fs";
 import * as path from "path";
-import * as crypto from "crypto";
 import mammoth from "mammoth";
 import "dotenv/config";
 import { initKiosk, startStatusServer, formatUptime } from "./kiosk.js";
@@ -27,6 +26,13 @@ import {
   getBudgetAwareParams, applyMoodModifiers, startLizardLoop,
   type BudgetAwareParams,
 } from "./lizard-brain.js";
+import {
+  initCalendar, pendingContactTag, setPendingContactTag, consumePendingContactTag,
+  loadCalendar, saveCalendar, generateEventId, parseVCard, vcardToJid,
+  findUserName, processCalendarDigests,
+  DAY_NAMES_SHORT, DAY_NAMES_FULL, DAY_MAP,
+  type CalendarEvent, type CalendarData,
+} from "./calendar.js";
 
 // ============================================================================
 // Configuration
@@ -82,24 +88,6 @@ const CONFIG = {
 if (process.env.OPENCLAW_TIMEZONE) {
   process.env.TZ = process.env.OPENCLAW_TIMEZONE;
 }
-
-// Pending contact tag state: chatId -> { eventId, expiresAt }
-const pendingContactTag = new Map<string, { eventId: string; expiresAt: number }>();
-
-function setPendingContactTag(chatId: string, eventId: string): void {
-  pendingContactTag.set(chatId, { eventId, expiresAt: Date.now() + 120_000 });
-}
-
-function consumePendingContactTag(chatId: string): string | null {
-  const pending = pendingContactTag.get(chatId);
-  if (!pending || Date.now() > pending.expiresAt) {
-    pendingContactTag.delete(chatId);
-    return null;
-  }
-  pendingContactTag.delete(chatId);
-  return pending.eventId;
-}
-
 
 // Message sender callback (set when WhatsApp connects)
 let sendMessageFn: ((chatId: string, text: string) => Promise<void>) | null = null;
@@ -438,259 +426,6 @@ function saveMemory(chatId: string, memory: UserMemory): void {
   fs.writeFileSync(getMemoryPath(chatId), JSON.stringify(memory));
 }
 
-// ============================================================================
-// Calendar / Events System
-// ============================================================================
-
-type CalendarEvent = {
-  id: string;
-  title: string;
-  recurrence: "daily" | "weekly" | "once";
-  dayOfWeek?: number;       // 0=Sun..6=Sat (weekly only)
-  time: string;             // "HH:MM" 24h
-  date?: string;            // "YYYY-MM-DD" (once only)
-  taggedUsers: Array<{ jid: string; name: string }>;
-  createdBy: string;
-  createdAt: number;
-  chatId: string;
-};
-
-type CalendarData = {
-  events: CalendarEvent[];
-  digestConfig: { dailyTime: string; weeklyDay: number; weeklyTime: string };
-  lastDailyDigest: Record<string, number>;
-  lastWeeklyDigest: Record<string, number>;
-};
-
-const DAY_NAMES_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const DAY_NAMES_FULL = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-const DAY_MAP: Record<string, number> = {
-  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
-};
-
-function getCalendarPath(): string {
-  return path.join(CONFIG.workspaceDir, "calendar.json");
-}
-
-function loadCalendar(): CalendarData {
-  try {
-    const data = fs.readFileSync(getCalendarPath(), "utf-8");
-    return JSON.parse(data);
-  } catch {
-    return {
-      events: [],
-      digestConfig: { dailyTime: "07:00", weeklyDay: 0, weeklyTime: "18:00" },
-      lastDailyDigest: {},
-      lastWeeklyDigest: {},
-    };
-  }
-}
-
-function saveCalendar(cal: CalendarData): void {
-  fs.writeFileSync(getCalendarPath(), JSON.stringify(cal));
-}
-
-function generateEventId(): string {
-  return crypto.randomBytes(4).toString("hex");
-}
-
-function parseVCard(vcard: string): { phoneNumber: string; name: string } | null {
-  const fnMatch = vcard.match(/FN:(.+)/i);
-  const name = fnMatch?.[1]?.trim() || "Unknown";
-
-  // Prefer waid (WhatsApp ID) if present
-  const waidMatch = vcard.match(/waid=(\d+)/i);
-  if (waidMatch) {
-    return { phoneNumber: waidMatch[1], name };
-  }
-
-  // Fall back to TEL field
-  const telMatch = vcard.match(/TEL[^:]*:([+\d\s()-]+)/i);
-  if (!telMatch) return null;
-
-  const rawNumber = telMatch[1].replace(/[^0-9]/g, "");
-  if (!rawNumber || rawNumber.length < 7) return null;
-
-  return { phoneNumber: rawNumber, name };
-}
-
-function vcardToJid(phoneNumber: string): string {
-  return `${phoneNumber}@s.whatsapp.net`;
-}
-
-function getTimeStr(date: Date): string {
-  return date.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
-}
-
-function getDateStr(date: Date): string {
-  return date.toISOString().split("T")[0];
-}
-
-function isTimeWithinWindow(current: string, target: string, windowSeconds: number): boolean {
-  const [ch, cm] = current.split(":").map(Number);
-  const [th, tm] = target.split(":").map(Number);
-  const currentSecs = ch * 3600 + cm * 60;
-  const targetSecs = th * 3600 + tm * 60;
-  const diff = Math.abs(currentSecs - targetSecs);
-  return diff <= windowSeconds || (86400 - diff) <= windowSeconds;
-}
-
-function collectTodayEvents(events: CalendarEvent[], currentDay: number, todayStr: string): Record<string, CalendarEvent[]> {
-  const result: Record<string, CalendarEvent[]> = {};
-
-  for (const evt of events) {
-    let isToday = false;
-    if (evt.recurrence === "daily") isToday = true;
-    else if (evt.recurrence === "weekly" && evt.dayOfWeek === currentDay) isToday = true;
-    else if (evt.recurrence === "once" && evt.date === todayStr) isToday = true;
-
-    if (isToday) {
-      for (const user of evt.taggedUsers) {
-        if (!result[user.jid]) result[user.jid] = [];
-        result[user.jid].push(evt);
-      }
-    }
-  }
-
-  for (const jid of Object.keys(result)) {
-    result[jid].sort((a, b) => a.time.localeCompare(b.time));
-  }
-  return result;
-}
-
-function collectWeekEvents(events: CalendarEvent[], startDay: number, startDateStr: string): Record<string, Record<number, CalendarEvent[]>> {
-  const result: Record<string, Record<number, CalendarEvent[]>> = {};
-  const startDate = new Date(startDateStr + "T00:00:00");
-
-  for (let d = 0; d < 7; d++) {
-    const day = (startDay + d) % 7;
-    const dateForDay = new Date(startDate.getTime() + d * 86400000);
-    const dateStr = getDateStr(dateForDay);
-
-    for (const evt of events) {
-      let matches = false;
-      if (evt.recurrence === "daily") matches = true;
-      else if (evt.recurrence === "weekly" && evt.dayOfWeek === day) matches = true;
-      else if (evt.recurrence === "once" && evt.date === dateStr) matches = true;
-
-      if (matches) {
-        for (const user of evt.taggedUsers) {
-          if (!result[user.jid]) result[user.jid] = {};
-          if (!result[user.jid][day]) result[user.jid][day] = [];
-          result[user.jid][day].push(evt);
-        }
-      }
-    }
-  }
-
-  for (const jid of Object.keys(result)) {
-    for (const day of Object.keys(result[jid])) {
-      result[jid][Number(day)].sort((a, b) => a.time.localeCompare(b.time));
-    }
-  }
-  return result;
-}
-
-function findUserName(events: CalendarEvent[], jid: string): string {
-  for (const evt of events) {
-    const user = evt.taggedUsers.find(u => u.jid === jid);
-    if (user) return user.name;
-  }
-  return "there";
-}
-
-function cleanupPastEvents(cal: CalendarData): boolean {
-  const todayStr = getDateStr(new Date());
-  const before = cal.events.length;
-  cal.events = cal.events.filter(evt => {
-    if (evt.recurrence !== "once") return true;
-    return evt.date! >= todayStr;
-  });
-  return cal.events.length !== before;
-}
-
-async function processCalendarDigests(): Promise<void> {
-  if (!sendMessageFn) return;
-
-  const cal = loadCalendar();
-  if (cal.events.length === 0) return;
-
-  const now = new Date();
-  const currentTime = getTimeStr(now);
-  const currentDay = now.getDay();
-  const todayStr = getDateStr(now);
-  const nowMs = now.getTime();
-
-  // --- Daily Digest ---
-  if (isTimeWithinWindow(currentTime, cal.digestConfig.dailyTime, 60)) {
-    const userEvents = collectTodayEvents(cal.events, currentDay, todayStr);
-    let saved = false;
-
-    for (const [jid, events] of Object.entries(userEvents)) {
-      const lastSent = cal.lastDailyDigest[jid] || 0;
-      if (todayStr === getDateStr(new Date(lastSent))) continue;
-
-      const userName = findUserName(cal.events, jid);
-      let msg = `📅 *Good morning, ${userName}!*\n\nHere's your schedule for today:\n\n`;
-      for (const evt of events) {
-        msg += `• *${evt.time}* - ${evt.title}\n`;
-      }
-
-      try {
-        await sendMessageFn(jid, msg);
-        cal.lastDailyDigest[jid] = nowMs;
-        saved = true;
-        console.log(`[calendar] Sent daily digest to ${jid}`);
-      } catch (err) {
-        console.error(`[calendar] Failed daily digest to ${jid}:`, err);
-      }
-    }
-    if (saved) saveCalendar(cal);
-  }
-
-  // --- Weekly Digest ---
-  if (currentDay === cal.digestConfig.weeklyDay && isTimeWithinWindow(currentTime, cal.digestConfig.weeklyTime, 60)) {
-    const userWeekEvents = collectWeekEvents(cal.events, currentDay, todayStr);
-    let saved = false;
-
-    for (const [jid, dayMap] of Object.entries(userWeekEvents)) {
-      const lastSent = cal.lastWeeklyDigest[jid] || 0;
-      if (nowMs - lastSent < 23 * 60 * 60 * 1000) continue;
-
-      const userName = findUserName(cal.events, jid);
-      let msg = `📅 *Weekly Schedule, ${userName}!*\n\nHere's your week ahead:\n\n`;
-
-      for (let d = 0; d < 7; d++) {
-        const day = (currentDay + d) % 7;
-        const dateForDay = new Date(now.getTime() + d * 86400000);
-        const eventsForDay = dayMap[day] || [];
-        if (eventsForDay.length === 0) continue;
-
-        msg += `*${DAY_NAMES_FULL[day]} ${getDateStr(dateForDay)}*\n`;
-        for (const evt of eventsForDay) {
-          msg += `  • ${evt.time} - ${evt.title}\n`;
-        }
-        msg += `\n`;
-      }
-
-      try {
-        await sendMessageFn(jid, msg);
-        cal.lastWeeklyDigest[jid] = nowMs;
-        saved = true;
-        console.log(`[calendar] Sent weekly digest to ${jid}`);
-      } catch (err) {
-        console.error(`[calendar] Failed weekly digest to ${jid}:`, err);
-      }
-    }
-    if (saved) saveCalendar(cal);
-  }
-
-  // Cleanup past one-time events
-  if (cleanupPastEvents(cal)) {
-    saveCalendar(cal);
-    console.log("[calendar] Cleaned up past one-time events");
-  }
-}
 
 async function extractFacts(chatId: string, conversation: string): Promise<string[]> {
   const client = getClient();
@@ -1399,6 +1134,9 @@ async function startWhatsApp(): Promise<void> {
   fs.mkdirSync(CONFIG.authDir, { recursive: true });
   fs.mkdirSync(CONFIG.sessionsDir, { recursive: true });
 
+  // Initialize calendar
+  initCalendar(CONFIG.workspaceDir);
+
   // Initialize lizard-brain
   initLizardBrain({
     model: CONFIG.model,
@@ -1473,7 +1211,7 @@ async function startWhatsApp(): Promise<void> {
       };
       startLizardLoop(
         sendMessageFn,
-        () => processCalendarDigests(),
+        () => processCalendarDigests(sendMessageFn!),
         () => {
           for (const [chatId, state] of pendingContactTag.entries()) {
             if (Date.now() > state.expiresAt) {
