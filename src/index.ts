@@ -1051,22 +1051,36 @@ function handleCommand(chatId: string, senderId: string, text: string): string |
       return "🦞 Session cleared. Starting fresh!";
 
     case "help":
+    case "commands":
       return `🦞 *ChadGPT Commands*
 
+*General*
+/help - Show this help
+/commands - Same as /help
 /clear - Clear conversation history
 /status - Show bot status
-/remember - Show what I remember about you
-/forget - Clear my memory of you
-/calendar - Show all events
-/event add - Add an event
-/event remove <id> - Remove event
-/event tag <id> - Tag a contact
-/event digest - Set digest times
-/gdrive setup - Connect Google Drive
-/gdrive status - Check Drive connection
-/gdrive disconnect - Disconnect Drive
-/help - Show this help
+/feed - Reset token budget & restore energy
 
+*Memory*
+/remember - Show what I remember about you
+/forget - Clear all memories about you
+
+*Calendar & Events*
+/calendar - Show all events
+/event add daily HH:MM Title
+/event add weekly Day HH:MM Title
+/event add once YYYY-MM-DD HH:MM Title
+/event remove <id> - Remove event
+/event tag <id> - Tag a contact to event
+/event digest daily HH:MM
+/event digest weekly Day HH:MM
+/skip - Cancel contact tagging
+${CONFIG.googleClientId ? `
+*Google Drive*
+/gdrive setup - Connect Google Drive
+/gdrive status - Check connection
+/gdrive disconnect - Disconnect
+` : ""}
 Just send a message to chat with me!`;
 
     case "status":
@@ -1119,6 +1133,14 @@ Running on minimal hardware 💪`;
         memoryReport += "*Our history:*\n" + mem.summary;
       }
       return memoryReport;
+    }
+
+    case "feed": {
+      const prevUsage = Math.round((lizardBrain.tokens.used / lizardBrain.tokens.budget) * 100);
+      lizardBrain.tokens.used = 0;
+      lizardBrain.energy = 100;
+      lizardBrain.stress = Math.max(0, lizardBrain.stress - 30);
+      return `🦞 *nom nom nom* 🍤\n\nThat hit the spot! Token budget reset (was ${prevUsage}% used). Energy fully restored. I'm ready to go!`;
     }
 
     case "forget":
