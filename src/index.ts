@@ -62,8 +62,11 @@ const CONFIG = {
   // Anthropic API key
   apiKey: process.env.ANTHROPIC_API_KEY || "",
 
-  // Model to use
-  model: process.env.OPENCLAW_MODEL || "claude-sonnet-4-20250514",
+  // Model to use (default: Haiku for cost savings, upgrades to smart model for complex tasks)
+  model: process.env.OPENCLAW_MODEL || "claude-haiku-4-5-20251001",
+
+  // Smart model for complex tasks (images, documents, tool use)
+  smartModel: process.env.OPENCLAW_SMART_MODEL || "claude-sonnet-4-20250514",
 
   // Max tokens per response
   maxTokens: parseInt(process.env.OPENCLAW_MAX_TOKENS || "4096", 10),
@@ -967,6 +970,13 @@ async function chat(chatId: string, userMessage: string, media?: MediaContent): 
   // Get budget-aware parameters
   const budgetParams = getBudgetAwareParams();
 
+  // Upgrade to smart model for complex tasks (images, documents, tool use)
+  const enabledTools = getEnabledTools();
+  const needsSmartModel = !!media || enabledTools.length > 0;
+  if (needsSmartModel && budgetParams.model === CONFIG.model) {
+    budgetParams.model = CONFIG.smartModel;
+  }
+
   // Block API calls if budget exhausted
   if (budgetParams.shouldBlock) {
     return "🔋 I've used up my thinking budget for today. Simple greetings and quick questions I can still handle, but for complex stuff, let's chat tomorrow! (Budget resets at midnight)";
@@ -1065,7 +1075,6 @@ async function chat(chatId: string, userMessage: string, media?: MediaContent): 
     // Build system prompt with memory context
     const systemPrompt = buildSystemPrompt() + buildMemoryContext(chatId);
 
-    const enabledTools = getEnabledTools();
     const response = await client.messages.create({
       model: budgetParams.model,
       max_tokens: budgetParams.maxTokens,

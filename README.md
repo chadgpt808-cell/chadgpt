@@ -113,7 +113,8 @@ Set these in your `.env` file or as environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | Yes | - | Your Anthropic API key |
-| `OPENCLAW_MODEL` | No | `claude-sonnet-4-20250514` | Claude model to use |
+| `OPENCLAW_MODEL` | No | `claude-haiku-4-5-20251001` | Default model for simple chat |
+| `OPENCLAW_SMART_MODEL` | No | `claude-sonnet-4-20250514` | Model for images, docs, and tool use |
 | `OPENCLAW_MAX_TOKENS` | No | `4096` | Max tokens per response |
 | `OPENCLAW_MAX_HISTORY` | No | `50` | Messages to keep in history |
 | `OPENCLAW_ALLOW_LIST` | No | *(all)* | Comma-separated phone numbers |
